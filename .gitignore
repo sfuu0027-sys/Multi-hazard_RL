@@ -1,0 +1,121 @@
+# Results and Figures
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.svg
+# *.pdf
+*.eps
+*.tif
+*.tiff
+
+# Logs
+*.log
+logs/
+log/
+
+# LaTeX auxiliary files
+*.aux
+*.bbl
+*.blg
+*.bcf
+*.run.xml
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+*.toc
+*.out
+*.lof
+*.lot
+*.nav
+*.snm
+*.vrb
+*.xdv
+*.dvi
+*.ps
+_minted*/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints and outputs
+checkpoints/
+outputs/
+results/
+*.pth
+*.pt
+*.pkl
+*.h5
+*.hdf5
+
+# Data files (large)
+*.csv
+*.xlsx
+*.parquet
+*.feather
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.zip
+
+Prompt.md
+RL_Code/ablation_results
+AGENTS.md
+Test/
+Paper/
+export_figure4.py
+extract_lifecycle_pdf.py
+Figure4_page_11_caption_snippet.txt
+Figure4_page_12_caption_snippet.txt
+Lifecycle management .extracted.txt
+Lifecycle management .pdf
+Lifecycle management .summary.json
+.trae/
+backups/
+prompt.assets/
+reference/
+RL_Code/fig_0_0.2_0.4/
+RL_Code/RLNotes.md
+伪代码/Word安装方法.md
+伪代码/
+Improvement.md
+Lifecycle management.txt
+贴现策略.md
+Note.md
+.git/

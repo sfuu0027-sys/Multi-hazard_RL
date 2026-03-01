@@ -1,0 +1,72 @@
+{
+  "io": {
+    "fig_dir": "fig",
+    "out_json": "cem_results_case3c_resilience_oriented.json",
+    "iter_trajectories": "iter_trajectories_case3c_resilience_oriented.json",
+    "log_dir": "log"
+  },
+  "lifecycle": {
+    "horizon_years": 100,
+    "dt_years": 1.0,
+    "maintenance_interval_years": 10,
+    "hazard_intensity_probs": [
+      0.6,
+      0.3,
+      0.1
+    ],
+    "f_crit": 0.7,
+    "f_1": 0.5,
+    "f_2": 0.3,
+    "c_1": 1.0,
+    "c_2": 4.0,
+    "c_3": 10.0,
+    "deterioration_model": "weibull",
+    "det_alpha_T_levels": [
+      0.75,
+      0.5,
+      0.25
+    ],
+    "det_tau_years": 55.0,
+    "det_k": 2.2,
+    "det_sigma": 0.0,
+    "base_deterioration_rate": 0.03,
+    "maint_costs": [
+      0.0,
+      0.8,
+      2.0
+    ],
+    "maint_rate_multipliers": [
+      1.0,
+      0.7,
+      0.45
+    ],
+    "repair_costs": [
+      0.0,
+      3.0,
+      10.0
+    ],
+    "repair_recovery_deltas": [
+      0.0,
+      0.25,
+      0.5
+    ],
+    "discount_rate": 0.03,
+    "objective_cost_metric": "lcc",
+    "w_floor": 0.0,
+    "repair_stop_years": 0.0,
+    "lambda_eq_per_year": 0.02857142857142857,
+    "lambda_fire_per_year": 0.29239766081871343,
+    "w_lr": 0.7,
+    "w_risk": 0.15,
+    "w_cost": 0.15
+  },
+  "cem": {
+    "iterations": 200,
+    "population": 80,
+    "elite_frac": 0.2,
+    "eval_episodes": 30,
+    "seed": 20260301,
+    "plot_first_n": 40,
+    "plot_interval": 2
+  }
+}
