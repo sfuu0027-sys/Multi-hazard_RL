@@ -1,19 +1,50 @@
-# 多灾种生命周期管理（RL/CEM）论文主仓库
+# Multi-Hazard Lifecycle Management (RL/CEM)
 
-本仓库是论文 _Lifecycle management_ 的主代码仓库，面向多灾种（地震 + 火灾）生命周期管理：用物理/经验校准的退化—灾害—恢复环境生成 $F(t)$，并以**韧性损失**、**阈值触发风险**、**折现成本（NPV）**构造统一目标，通过策略搜索获得可解释的阈值型干预策略（预加固/维护/灾后修复）。
+本仓库提供一个公开可复现的多灾种（地震 + 火灾）生命周期管理实现：通过退化-灾害-恢复环境生成结构性能曲线，并以**韧性损失**、**阈值触发风险**、**折现成本（NPV）**构造统一目标，搜索可解释的阈值型干预策略（预加固/维护/灾后修复）。
 
-当前实现采用 Cross-Entropy Method（CEM）对阈值型策略参数做黑盒优化；仓库同时包含论文排版文件与出图脚本。
+当前实现采用 Cross-Entropy Method（CEM）对策略参数进行黑盒优化；仓库同时包含出图脚本与文档排版文件。
 
 ---
 
-## 1. 关键概念（与论文一致）
+## 1. 关键概念
 
-- **状态**：$s_t=[F(t),t/T]$
-- **动作**：$P\in\{0,1,2\}$（$t=0$ 预加固）、$M_t\in\{0,1,2\}$（周期维护）、$R_t\in\{0,1,2\}$（灾后修复）
-- **韧性损失**（Resilience loss）：对 $(1-F(t))$ 的折现面积积分
-- **风险**（Risk）：只在 $F(t)<F_{crit}$ 时累积，并用分段后果函数 $C_f(F)$ 表示后果强度（论文 Eq.(8)(9)）
-- **成本**（Cost / NPV）：预加固、维护、修复的成本按连续折现汇总
-- **奖励/目标**：按每步增量指标（带折现）构造 $r_t$，最大化期望累计回报（论文 Eq.(18)-(21)）
+- **状态**
+
+```math
+s_t=[F(t),\, t/T]
+```
+
+- **动作**
+
+```math
+P\in\{0,1,2\},\quad M_t\in\{0,1,2\},\quad R_t\in\{0,1,2\}
+```
+
+其中 `P` 表示 `t=0` 的预加固，`M_t` 表示周期维护，`R_t` 表示灾后修复。
+
+- **韧性损失（Resilience loss）**
+
+```math
+L_R=\int_0^T e^{-\rho t}\,(1-F(t))\,dt
+```
+
+- **风险（Risk）**
+
+```math
+L_{\text{risk}}=\int_0^T e^{-\rho t}\,\mathbf{1}[F(t)<F_{\text{crit}}]\cdot C_f(F(t))\,dt
+```
+
+- **成本（Cost / NPV）**
+
+```math
+\mathrm{NPV}=C_P(P)+\int_0^T e^{-\rho t}\,\bigl(C_M(M_t)+C_R(R_t)\bigr)\,dt
+```
+
+- **优化目标**
+
+```math
+\max_{\pi}\ J(\pi)=\mathbb{E}_{\pi}\left[\sum_{t} r_t\right]
+```
 
 ---
 
@@ -26,10 +57,10 @@
   - `cem_results_*.json`、`iter_trajectories_*.json`：训练输出与轨迹记录
   - `fig/`：输出图片目录（汇总图 + 每个 case 的子目录）
 - [Paper/](Paper/)
-  - [Multi-hazard RL.tex](Paper/Multi-hazard%20RL.tex)：论文正文（直接引用 `RL_Code/fig/` 下的图片）
+  - [Multi-hazard RL.tex](Paper/Multi-hazard%20RL.tex)：文档正文（直接引用 `RL_Code/fig/` 下的图片）
 - 其他说明文档
   - [Note.md](Note.md)：建模与实现要点
-  - [RLNotes.md](RL_Code/RLNotes.md)：与论文公式/假设的逐条笔记
+  - [RLNotes.md](RL_Code/RLNotes.md)：公式/假设的逐条笔记
   - [Improvement.md](Improvement.md)：灾害频率口径与来源说明
 
 ---
@@ -51,7 +82,7 @@
 conda activate cudadev
 ```
 
-### 3.2 论文编译依赖
+### 3.2 文档编译依赖
 
 - TeX Live（含 `xelatex`）
 - biber（biblatex 后端）
@@ -98,7 +129,7 @@ python RL_Code/train_lifecycle_rl.py RL_Code/case1_baseline.json --replot
 
 ### 4.4 图标题开关
 
-为适配论文排版，脚本默认**不显示图上方标题**；需要标题时加参数：
+脚本默认**不显示图上方标题**；需要标题时加参数：
 
 ```bash
 python RL_Code/train_lifecycle_rl.py --all --replot --titles
@@ -106,7 +137,7 @@ python RL_Code/train_lifecycle_rl.py --all --replot --titles
 
 ---
 
-## 5. 论文（Paper）一键编译
+## 5. 文档（可选）一键编译
 
 ```bash
 cd Paper
@@ -128,6 +159,7 @@ xelatex -interaction=nonstopmode -halt-on-error "Multi-hazard RL.tex"
 输出目录：`RL_Code/fig/`
 
 - 汇总训练曲线（用于论文 Figure）：
+ - 汇总训练曲线（常用展示图）：
   - `rl_eval_loss_per_step.png`（loss 采用归一化显示，便于“从大到小”的趋势展示）
   - `rl_eval_lor_per_episode.png`
   - `rl_eval_reward_per_episode.png`（图例为 3 列两行，位于坐标轴框内右下角）
@@ -157,7 +189,7 @@ xelatex -interaction=nonstopmode -halt-on-error "Multi-hazard RL.tex"
 
 ## 9. 引用（Citation）
 
-如果你使用了本仓库的代码/图/实验设置，请在论文或报告中引用对应论文，并在此处补充 BibTeX（待发布时完善）。
+如果你使用了本仓库的代码/图/实验设置，请在你的工作中引用本仓库地址，并按你的发布流程补充 BibTeX。
 
 ---
 
