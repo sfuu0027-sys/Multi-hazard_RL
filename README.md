@@ -7,21 +7,21 @@ The Cross-Entropy Method (CEM) is adopted for multi-objective optimization to se
 
 ---
 
-## 1. key concept
+## 1. Key Concept
 
-- **state**
+- **State**
 
 ```math
 s_t=[F(t),\, t/T]
 ```
 
-- **动作**
+- **Actions**
 
 ```math
 P\in\{0,1,2\},\quad M_t\in\{0,1,2\},\quad R_t\in\{0,1,2\}
 ```
 
-其中 `P` 表示 `t=0` 的预加固，`M_t` 表示周期维护，`R_t` 表示灾后修复。
+Here, P denotes pre-reinforcement at t=0, M_t denotes periodic maintenance, and R_t denotes post-disaster repair.
 
 - **Resilience loss**
 
@@ -41,7 +41,7 @@ L_{\text{risk}}=\int_0^T e^{-\rho t}\,\mathbf{1}[F(t)<F_{\text{crit}}]\cdot C_f(
 \mathrm{NPV}=C_P(P)+\int_0^T e^{-\rho t}\,\bigl(C_M(M_t)+C_R(R_t)\bigr)\,dt
 ```
 
-- **优化目标**
+- **Repository Structure**
 
 ```math
 \max_{\pi}\ J(\pi)=\mathbb{E}_{\pi}\left[\sum_{t} r_t\right]
@@ -49,74 +49,74 @@ L_{\text{risk}}=\int_0^T e^{-\rho t}\,\mathbf{1}[F(t)<F_{\text{crit}}]\cdot C_f(
 
 ---
 
-## 2. 仓库结构
+## 2. Repository Structure
 
 - [RL_Code/](RL_Code/)
-  - [train_lifecycle_rl.py](RL_Code/train_lifecycle_rl.py)：主程序（训练/重绘/批量 case）
-  - `case*.json`：各 case 的配置（hazard rates、权重、CEM 参数、输出路径）
-  - `run_config.json`：单 case 默认配置示例
-  - `cem_results_*.json`、`iter_trajectories_*.json`：训练输出与轨迹记录
-  - `fig/`：输出图片目录（汇总图 + 每个 case 的子目录）
+  - [train_lifecycle_rl.py](RL_Code/train_lifecycle_rl.py)：main entry point (training / re-plotting / batch cases)
+  - `case*.json`：configuration files for each case (hazard rates, weights, CEM settings, output paths)
+  - `run_config.json`：an example default configuration for a single case
+  - `cem_results_*.json`、`iter_trajectories_*.json`：training outputs and trajectory logs
+  - `fig/`：output figure directory (summary plots + per-case subfolders)
 
 ---
 
-## 3. 环境依赖
+## 3. Dependencies
 
-### 3.1 Python 依赖
+### 3.1 Python Requirements
 
-主脚本依赖：
+Main dependencies：
 
-- Python 3.10+（建议）
+- Python 3.10+（recommended）
 - numpy
 - matplotlib
-- torch（可选：存在则使用 torch 加速批量评估；缺失时自动回退）
+- torch（optional: used for accelerating batch evaluation when available; the code falls back automatically if absent）
 
-本项目默认使用 conda 环境名 `cudadev`：
+This project assumes a conda environment named `cudadev` by default：
 
 ```bash
 conda activate cudadev
 ```
 
-## 4. 快速开始（训练与出图）
+## 4. Quick Start (Training and Plotting)
 
-以下命令均在仓库根目录运行。
+All commands below should be executed from the repository root.
 
-### 4.1 训练全部 case（200 轮）
+### 4.1 Train All Cases (200 iterations)
 
 ```bash
 conda activate cudadev
 python RL_Code/train_lifecycle_rl.py --all
 ```
 
-输出：
+Outputs：
 
 - `RL_Code/cem_results_case*.json`
 - `RL_Code/iter_trajectories_case*.json`
 - `RL_Code/fig/` 下的汇总图与各 case 图片
 
-### 4.2 仅重绘（不重新训练）
+### 4.2 Re-plot Only (No Retraining)
 
-当已有 `cem_results_case*.json` 时，可只重算绘图用的对比轨迹并重绘：
+If `cem_results_case*.json` already exist, you can regenerate comparison trajectories and figures without retraining：
 
 ```bash
 python RL_Code/train_lifecycle_rl.py --all --replot
 ```
 
-### 4.3 单独运行一个 case
+### 4.3 Run a Single Case
 
 ```bash
 python RL_Code/train_lifecycle_rl.py RL_Code/case1_baseline.json
 ```
 
-只重绘单 case：
+Re-plot a single case only：
 
 ```bash
 python RL_Code/train_lifecycle_rl.py RL_Code/case1_baseline.json --replot
 ```
 
-### 4.4 图标题开关
+### 4.4 Toggle Figure Titles
 
-脚本默认**不显示图上方标题**；需要标题时加参数：
+By default, the script**does not display titles**at the top of plots. To enable titles：
 
 ```bash
 python RL_Code/train_lifecycle_rl.py --all --replot --titles
@@ -124,29 +124,29 @@ python RL_Code/train_lifecycle_rl.py --all --replot --titles
 
 ---
 
-## 5. 配置说明（json）
+## 5. Configuration (JSON)
 
-所有 case 配置位于 `RL_Code/case*.json`，结构如下：
+All case configurations are stored in `RL_Code/case*.json`，with the following structure：
 
-- `io`：输出路径（fig、json、log）
-- `lifecycle`：生命周期模型参数（$T$、$\Delta t$、阈值、成本、退化、灾害、折现等）
-- `cem`：CEM 参数（迭代轮数、种群规模、精英比例、评估 episode 数等）
-
----
-
-## 6. 随机性与可重复性
-
-- 训练过程由 `seed` 控制随机性；不同机器/不同 torch 版本可能存在细微差异。
-- `--replot` 会从结果文件中读取最优参数，并在固定 `compare_seed` 下重模拟，以保证对比图一致。
+- `io`：output paths（fig、json、log）
+- `lifecycle`：lifecycle model parameters（$T$、$\Delta t$、thresholds、 costs、 deterioration、 hazards、 discounting, etc.）
+- `cem`：CEM settings (iterations, population size, elite fraction, number of evaluation episodes, etc.)
 
 ---
 
-## 7. 引用（Citation）
+## 6. Randomness and Reproducibility
 
-如果你使用了本仓库的代码/图/实验设置，请在你的工作中引用本仓库地址，并按你的发布流程补充 BibTeX。
+- Training randomness is controlled by `seed` ；Minor differences may appear across machines or torch versions.
+- `--replot` loads the optimal parameters from saved result files and re-simulates under a fixed `compare_seed` to ensure consistent comparison plots.
+
+---
+
+## 7. Citation
+
+If you use the code, figures, or experimental settings from this repository, please cite the repository URL in your work and add a BibTeX entry following your publication requirements.
 
 ---
 
 ## 8. License
 
-本项目采用 MIT License，详见 [LICENSE](LICENSE)。
+This project is released under the MIT License. See [LICENSE](LICENSE) for details.
