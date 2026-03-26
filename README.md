@@ -1,14 +1,15 @@
 # Multi-Hazard Lifecycle Management (RL/CEM)
 
-本仓库提供一个公开可复现的多灾种（地震 + 火灾）生命周期管理实现：通过退化-灾害-恢复环境生成结构性能曲线，并以**韧性损失**、**阈值触发风险**、**折现成本（NPV）**构造统一目标，搜索可解释的阈值型干预策略（预加固/维护/灾后修复）。
 
-当前实现采用 Cross-Entropy Method（CEM）对策略参数进行黑盒优化；仓库包含训练与出图相关脚本。
+This repository provides an open and reproducible implementation of multi-hazard (taking long-term deterioration + earthquake + fire as an example) life-cycle management: By constructing an environment through long-term deterioration-abrupt disturbance-restoration, it generates structural performance curves and constructs a unified objective based on discounted resilience loss, threshold-triggered risk, and cost to search for interpretable intervention strategies (pre-reinforcement/maintenance/post-disaster repair). 
+
+The Cross-Entropy Method (CEM) is adopted for multi-objective optimization to select the optimal combination of intervention strategies. It also presents training procedures and ablation studies.
 
 ---
 
-## 1. 关键概念
+## 1. key concept
 
-- **状态**
+- **state**
 
 ```math
 s_t=[F(t),\, t/T]
@@ -22,19 +23,19 @@ P\in\{0,1,2\},\quad M_t\in\{0,1,2\},\quad R_t\in\{0,1,2\}
 
 其中 `P` 表示 `t=0` 的预加固，`M_t` 表示周期维护，`R_t` 表示灾后修复。
 
-- **韧性损失（Resilience loss）**
+- **Resilience loss**
 
 ```math
 L_R=\int_0^T e^{-\rho t}\,(1-F(t))\,dt
 ```
 
-- **风险（Risk）**
+- **Risk**
 
 ```math
 L_{\text{risk}}=\int_0^T e^{-\rho t}\,\mathbf{1}[F(t)<F_{\text{crit}}]\cdot C_f(F(t))\,dt
 ```
 
-- **成本（Cost / NPV）**
+- **Cost / NPV**
 
 ```math
 \mathrm{NPV}=C_P(P)+\int_0^T e^{-\rho t}\,\bigl(C_M(M_t)+C_R(R_t)\bigr)\,dt
