@@ -92,7 +92,7 @@ Outputs：
 
 - `RL_Code/cem_results_case*.json`
 - `RL_Code/iter_trajectories_case*.json`
-- `RL_Code/fig/` 下的汇总图与各 case 图片
+- Summary figures and per-case figures under `RL_Code/fig/` 
 
 ### 4.2 Re-plot Only (No Retraining)
 
