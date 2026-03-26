@@ -21,7 +21,7 @@ s_t=[F(t),\, t/T]
 P\in\{0,1,2\},\quad M_t\in\{0,1,2\},\quad R_t\in\{0,1,2\}
 ```
 
-Here, <code>P'</code> denotes pre-reinforcement at t=0, 'M_t' denotes periodic maintenance, and 'R_t' denotes post-disaster repair.
+Here, <code>P</code> denotes pre-reinforcement at t=0, <code>M_t</code> denotes periodic maintenance, and <code>R_t</code> denotes post-disaster repair.
 
 - **Resilience loss**
 
