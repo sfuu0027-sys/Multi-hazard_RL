@@ -33,7 +33,7 @@ _PLOT_FONT: dict[str, float] = {
     "trade_title": 20.0,
     "trade_axis": 20.0,
     "trade_ticks": 20.0,
-    "trade_label": 20.0,
+    "trade_label": 16.0,
     "trade_legend": 20.0,
     "trade_legend_title": 20.0,
     "trade_bubble_legend": 16.0,
@@ -43,9 +43,41 @@ _PLOT_FONT: dict[str, float] = {
     "trade_footer": 20.0,
 }
 
+# Muted fills with restrained academic hatch patterns.
+_BAR_COLORS: list[str] = [
+    "#6F8FBF",
+    "#79AFC4",
+    "#98C7A3",
+    "#E5D48F",
+    "#D78895",
+    "#A996D2",
+    "#C79E74",
+]
+_BAR_HATCHES: list[str] = [
+    "////",
+    "\\\\\\\\",
+    "----",
+    "||||",
+    "xxxx",
+    "....",
+    "++",
+]
+_BAR_EDGE = "#222222"
+_BAR_STEP = 1.18
+_BAR_WIDTH = 0.58
+
+plt.rcParams["hatch.linewidth"] = 0.7
+
 
 def _font(name: str) -> float:
     return float(_PLOT_FONT[name])
+
+
+def _apply_full_frame(ax: Any, *, linewidth: float = 0.9, color: str = "#333333") -> None:
+    for side in ("top", "right", "bottom", "left"):
+        ax.spines[side].set_visible(True)
+        ax.spines[side].set_linewidth(float(linewidth))
+        ax.spines[side].set_color(color)
 
 
 def _display_variant_name(name: str) -> str:
@@ -55,6 +87,8 @@ def _display_variant_name(name: str) -> str:
         "no_resilience_term": "No resilience",
         "no_cost_term": "No cost",
         "no_pre_reinforcement": "No pre-reinforcement",
+        "no_maintenance": "No maintenance",
+        "no_repair": "No repair",
     }
     return name_map.get(str(name), str(name))
 
@@ -78,17 +112,28 @@ def _make_logger(log_path: Path) -> logging.Logger:
     return logger
 
 
-def _base_cfg() -> tl.LifecycleConfig:
-    # Same hazard setting as case1 baseline.
-    return tl.LifecycleConfig(
-        lambda_eq_per_year=1.0 / 35.0,
-        lambda_fire_per_year=1.0 / 3.42,
-        w_lr=1.0 / 3.0,
-        w_risk=1.0 / 3.0,
-        w_cost=1.0 / 3.0,
-        discount_rate=0.03,
-        w_floor=0.0,
+def _default_base_config_path() -> Path:
+    return Path(__file__).resolve().parent / "normalized_cases" / "case1_baseline_normalized.json"
+
+
+def _base_cfg(config_path: Path | None = None) -> tuple[tl.LifecycleConfig, tl.CEMConfig, Path]:
+    path = _default_base_config_path() if config_path is None else Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Normalized baseline config not found: {path}")
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    lifecycle_raw = raw.get("lifecycle", {})
+    cem_raw = raw.get("cem", {})
+    if not isinstance(lifecycle_raw, dict):
+        raise ValueError(f"'lifecycle' must be an object in {path}")
+    if not isinstance(cem_raw, dict):
+        raise ValueError(f"'cem' must be an object in {path}")
+
+    lifecycle_cfg = tl.LifecycleConfig(
+        **tl._coerce_lifecycle_config_dict(lifecycle_raw)  # type: ignore[attr-defined]
     )
+    cem_cfg = tl.CEMConfig(**cem_raw)
+    return lifecycle_cfg, cem_cfg, path.resolve()
 
 
 def _variants(base: tl.LifecycleConfig) -> list[dict[str, Any]]:
@@ -124,6 +169,23 @@ def _variants(base: tl.LifecycleConfig) -> list[dict[str, Any]]:
                 pre_deterioration_multipliers=(1.0, 1.0, 1.0),
             ),
         },
+        {
+            "name": "no_maintenance",
+            "desc": "Disable periodic maintenance actions throughout the lifecycle.",
+            "cfg": replace(
+                base,
+                maintenance_interval_years=0,
+            ),
+        },
+        {
+            "name": "no_repair",
+            "desc": "Disable post-disaster repair recovery and repair cost actions.",
+            "cfg": replace(
+                base,
+                repair_costs=(0.0, 0.0, 0.0),
+                repair_recovery_deltas=(0.0, 0.0, 0.0),
+            ),
+        },
     ]
 
 
@@ -136,6 +198,90 @@ def _best_params_from_result(result: dict[str, Any]) -> tl.PolicyParams:
         repair_t1=float(p["repair_t1"]),
         repair_t2=float(p["repair_t2"]),
     )
+
+
+def _reported_return_from_terms(metrics: dict[str, Any], cfg: dict[str, Any]) -> float:
+    """Raw scalarisation used for paper-comparable ablation return plots."""
+    w_lr = float(cfg.get("w_lr", 1.0 / 3.0))
+    w_risk = float(cfg.get("w_risk", 1.0 / 3.0))
+    w_cost = float(cfg.get("w_cost", 1.0 / 3.0))
+    lr = float(metrics["lr"])
+    risk = float(metrics["risk"])
+    cost = float(metrics.get("lcc", metrics.get("npv", 0.0)))
+    return float(-(w_lr * lr + w_risk * risk + w_cost * cost))
+
+
+def _ensure_reported_return(record: dict[str, Any]) -> None:
+    cfg = record.get("cfg", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    for key in ("best_eval_train", "best_eval_holdout"):
+        metrics = record.get(key)
+        if isinstance(metrics, dict):
+            metrics["reported_return"] = _reported_return_from_terms(metrics, cfg)
+
+
+def _metric_value(record: dict[str, Any], metric_key: str) -> float:
+    metrics = record["best_eval_holdout"]
+    if metric_key == "reported_return":
+        if "reported_return" not in metrics:
+            _ensure_reported_return(record)
+        return float(record["best_eval_holdout"]["reported_return"])
+    return float(metrics[metric_key])
+
+
+def _metric_axis_spec(metric_key: str, vals: np.ndarray) -> dict[str, Any]:
+    vals = np.asarray(vals, dtype=float)
+    if metric_key == "reported_return":
+        vmin = float(np.min(vals))
+        y_bottom = min(vmin * 2.45, -1.0)
+        return {
+            "scale": "symlog",
+            "scale_kwargs": {"linthresh": 1.0, "linscale": 1.0, "base": 10},
+            "ymin": y_bottom,
+            "ymax": 0.0,
+            "label_suffix": " (symlog)",
+        }
+
+    positive = vals[vals > 0.0]
+    if positive.size == 0:
+        return {
+            "scale": "linear",
+            "scale_kwargs": {},
+            "ymin": 0.0,
+            "ymax": 1.0,
+            "label_suffix": "",
+        }
+
+    vmin = float(np.min(positive))
+    vmax = float(np.max(vals))
+    top_scale = 1.8
+    if metric_key == "lr":
+        top_scale = 2.6
+    if metric_key == "risk":
+        top_scale = 4.8
+    return {
+        "scale": "log",
+        "scale_kwargs": {"base": 10},
+        "ymin": max(vmin / 1.8, 1.0e-3),
+        "ymax": max(vmax * top_scale, vmin * 2.0),
+        "label_suffix": " (log)",
+    }
+
+
+def _annotation_style_for_metric(metric_key: str, value: float) -> tuple[int, str]:
+    if metric_key == "reported_return":
+        return (-8, "top") if value <= 0.0 else (8, "bottom")
+    return (8, "bottom")
+
+
+def _metric_annotation_override(
+    metric_key: str,
+    variant_name: str,
+    *,
+    panel_kind: str,
+) -> dict[str, Any] | None:
+    return None
 
 
 def _run_one_variant(
@@ -168,6 +314,7 @@ def _run_one_variant(
         base_seed=int(seed + 700_000),
         episodes=int(holdout_episodes),
     )
+    holdout = dict(holdout)
     compare_ep = result["best"]["episode_compare_seed"]
     payload = {
         "name": name,
@@ -177,6 +324,13 @@ def _run_one_variant(
             "w_lr": float(cfg.w_lr),
             "w_risk": float(cfg.w_risk),
             "w_cost": float(cfg.w_cost),
+            "objective_cost_metric": str(cfg.objective_cost_metric),
+            "objective_normalization": str(cfg.objective_normalization),
+            "lr_ref": float(cfg.lr_ref),
+            "risk_ref": float(cfg.risk_ref),
+            "cost_ref": float(cfg.cost_ref),
+            "floor_ref": float(cfg.floor_ref),
+            "w_floor": float(cfg.w_floor),
             "pre_cost_options": list(map(float, cfg.pre_cost_options)),
             "pre_fcrit_multipliers": list(map(float, cfg.pre_fcrit_multipliers)),
             "pre_hazard_damage_multipliers": list(
@@ -203,16 +357,17 @@ def _run_one_variant(
         },
         "history": result["history"],
     }
+    _ensure_reported_return(payload)
     (run_dir / "ablation_summary.json").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
     logger.info(
-        "Ablation run done | variant=%s holdout_return=%.4f holdout_risk=%.3f holdout_npv=%.2f",
+        "Ablation run done | variant=%s holdout_return=%.4f holdout_risk=%.3f holdout_cost=%.2f",
         name,
         float(holdout["return"]),
         float(holdout["risk"]),
-        float(holdout["npv"]),
+        float(holdout["lcc"]),
     )
     return payload
 
@@ -231,44 +386,34 @@ def _plot_one_metric_bar(
         txt = _display_variant_name(n)
         txt = txt.replace(" No ", "\nNo ")
         labels.append(txt)
-    colors = ["#4C72B0", "#4E9FB5", "#86C5A3", "#E6D58C", "#CC6677"]
-    hatches = ["x", "/", "-", "\\", "o"]
     x = np.arange(len(names))
     fig, ax = plt.subplots(figsize=(16.0, 9.8))
-    vals = np.array([float(r["best_eval_holdout"][metric_key]) for r in records], dtype=float)
+    vals = np.array([_metric_value(r, metric_key) for r in records], dtype=float)
     bars = ax.bar(
         x,
         vals,
         width=0.72,
-        color=[colors[i % len(colors)] for i in range(len(vals))],
-        edgecolor="black",
-        linewidth=1.0,
-        alpha=0.95,
+        color=[_BAR_COLORS[i % len(_BAR_COLORS)] for i in range(len(vals))],
+        edgecolor=_BAR_EDGE,
+        linewidth=0.95,
+        alpha=0.96,
         zorder=3,
     )
     for i, b in enumerate(bars):
-        b.set_hatch(hatches[i % len(hatches)])
+        b.set_hatch(_BAR_HATCHES[i % len(_BAR_HATCHES)])
     ax.set_facecolor("#F7F7F7")
     x_tick_shift = 0.12
     ax.set_xticks(x + x_tick_shift)
     ax.set_xticklabels(labels, rotation=14, ha="right", rotation_mode="anchor")
     ax.tick_params(axis="both", labelsize=_font("metric_ticks"))
-    ax.set_ylabel(metric_ylabel, fontsize=_font("metric_axis"))
-    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.45, zorder=0)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    vmin = float(np.min(vals))
-    vmax = float(np.max(vals))
-    span = max(1.0, abs(vmax - vmin))
-    y_bottom = vmin - 0.30 * span
-    y_top = vmax + 0.40 * span
-    if vmax <= 0.0:
-        # For all-negative panels, lift the zero line by giving more room below.
-        y_bottom = vmin - 0.42 * span
-        y_top = max(2.0, vmax + 0.25 * span)
-    if vmin >= 0.0:
-        y_bottom = 0.0
-    ax.set_ylim(y_bottom, y_top)
+    ax.tick_params(axis="x", pad=8)
+    axis_spec = _metric_axis_spec(metric_key, vals)
+    ax.set_yscale(axis_spec["scale"], **axis_spec["scale_kwargs"])
+    ax.set_ylim(float(axis_spec["ymin"]), float(axis_spec["ymax"]))
+    ax.set_ylabel(metric_ylabel + str(axis_spec["label_suffix"]), fontsize=_font("metric_axis"))
+    ax.grid(True, axis="y", which="both", linestyle="--", linewidth=0.8, alpha=0.45, zorder=0)
+    _apply_full_frame(ax, linewidth=0.95)
+    ax.margins(x=0.12 if metric_key == "reported_return" else 0.06)
     baseline = float(vals[0])
     ax.axhline(
         baseline,
@@ -287,20 +432,23 @@ def _plot_one_metric_bar(
             marker = " \u2191" if higher_better and delta >= 0 else ""
             marker = marker or (" \u2193" if (not higher_better and delta <= 0) else "")
         label = f"{v:.2f}\n({sign}{delta:.2f}){marker}"
-        # Flip label direction near plot bounds to avoid clipping.
-        if v >= 0:
-            place_above = (y_top - v) >= (0.12 * span)
-        else:
-            place_above = (v - y_bottom) < (0.12 * span)
-        y_shift = 8 if place_above else -8
+        y_shift, va = _annotation_style_for_metric(metric_key, v)
+        label_font = 26.0 if metric_key == "reported_return" else _font("metric_value")
+        override = _metric_annotation_override(metric_key, str(names[i]), panel_kind="single")
+        xytext = (0, y_shift)
+        ha = "center"
+        if override is not None:
+            xytext = tuple(override["xytext"])
+            ha = str(override["ha"])
+            va = str(override["va"])
         ax.annotate(
             label,
             xy=(b.get_x() + b.get_width() / 2.0, v),
-            xytext=(0, y_shift),
+            xytext=xytext,
             textcoords="offset points",
-            ha="center",
-            va="bottom" if place_above else "top",
-            fontsize=_font("metric_value"),
+            ha=ha,
+            va=va,
+            fontsize=label_font,
             clip_on=False,
             bbox=dict(boxstyle="round,pad=0.12", facecolor="white", alpha=0.72, linewidth=0.0),
         )
@@ -310,15 +458,106 @@ def _plot_one_metric_bar(
     plt.close(fig)
 
 
+def _metric_specs() -> list[tuple[str, str, bool, str, str]]:
+    return [
+        ("reported_return", "Return", True, "ablation_metric_return.png", "(a) Return"),
+        ("lr", "Resilience loss", False, "ablation_metric_lr.png", "(b) Resilience loss"),
+        ("risk", "Risk", False, "ablation_metric_risk.png", "(c) Risk"),
+        ("lcc", "Cost", False, "ablation_metric_cost.png", "(d) Cost"),
+    ]
+
+
+def _plot_metric_grid(records: list[dict[str, Any]], out_path: Path) -> None:
+    labels = []
+    for rec in records:
+        txt = _display_variant_name(str(rec["name"]))
+        labels.append(txt.replace(" No ", "\nNo "))
+    x = np.arange(len(records))
+
+    fig, axes = plt.subplots(2, 2, figsize=(9.6, 7.2))
+    for ax, (metric_key, metric_ylabel, higher_better, _filename, caption) in zip(
+        axes.flat, _metric_specs()
+    ):
+        vals = np.array(
+            [_metric_value(r, metric_key) for r in records],
+            dtype=float,
+        )
+        bars = ax.bar(
+            x,
+            vals,
+            width=0.72,
+            color=[_BAR_COLORS[i % len(_BAR_COLORS)] for i in range(len(vals))],
+            edgecolor=_BAR_EDGE,
+            linewidth=0.6,
+            alpha=0.96,
+            zorder=3,
+        )
+        for i, b in enumerate(bars):
+            b.set_hatch(_BAR_HATCHES[i % len(_BAR_HATCHES)])
+
+        axis_spec = _metric_axis_spec(metric_key, vals)
+        ax.set_yscale(axis_spec["scale"], **axis_spec["scale_kwargs"])
+        ax.set_ylim(float(axis_spec["ymin"]), float(axis_spec["ymax"]))
+
+        baseline = float(vals[0])
+        ax.axhline(
+            baseline,
+            color="#2F4F4F",
+            linestyle=":",
+            linewidth=0.6,
+            alpha=0.8,
+            zorder=2,
+        )
+        for i, b in enumerate(bars):
+            v = float(vals[i])
+            delta = v - baseline
+            sign = "+" if delta >= 0 else ""
+            marker = ""
+            if i != 0:
+                marker = " \u2191" if higher_better and delta >= 0 else ""
+                marker = marker or (" \u2193" if (not higher_better and delta <= 0) else "")
+            label = f"{v:.2f}\n({sign}{delta:.2f}){marker}"
+            y_shift, va = _annotation_style_for_metric(metric_key, v)
+            override = _metric_annotation_override(metric_key, str(records[i]["name"]), panel_kind="grid")
+            xytext = (0, 4 if y_shift > 0 else -4)
+            ha = "center"
+            if override is not None:
+                raw_xytext = tuple(override["xytext"])
+                xytext = (int(raw_xytext[0]), 4 if int(raw_xytext[1]) > 0 else -4)
+                ha = str(override["ha"])
+                va = str(override["va"])
+            ax.annotate(
+                label,
+                xy=(b.get_x() + b.get_width() / 2.0, v),
+                xytext=xytext,
+                textcoords="offset points",
+                ha=ha,
+                va=va,
+                fontsize=8.8,
+                clip_on=False,
+                bbox=dict(boxstyle="round,pad=0.08", facecolor="white", alpha=0.74, linewidth=0.0),
+            )
+
+        ax.set_facecolor("#F7F7F7")
+        ax.set_xticks(x + 0.10)
+        ax.set_xticklabels(labels, rotation=14, ha="right", rotation_mode="anchor", fontsize=9.2)
+        ax.tick_params(axis="y", labelsize=9.4)
+        ax.tick_params(axis="x", pad=6)
+        ax.set_ylabel(metric_ylabel + str(axis_spec["label_suffix"]), fontsize=10.5)
+        ax.grid(True, axis="y", which="both", linestyle="--", linewidth=0.5, alpha=0.40, zorder=0)
+        _apply_full_frame(ax, linewidth=0.8)
+        ax.margins(x=0.12 if metric_key == "reported_return" else 0.06)
+        ax.text(0.5, -0.34, caption, transform=ax.transAxes, ha="center", va="top", fontsize=11.5)
+
+    fig.subplots_adjust(left=0.08, right=0.99, top=0.98, bottom=0.12, wspace=0.30, hspace=0.58)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
 def _plot_metric_panels(records: list[dict[str, Any]], out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    metric_specs = [
-        ("return", "Return", True, "ablation_metric_return.png"),
-        ("lr", "Resilience loss", False, "ablation_metric_lr.png"),
-        ("risk", "Risk", False, "ablation_metric_risk.png"),
-        ("npv", "Cost", False, "ablation_metric_npv.png"),
-    ]
-    for key, ylabel, higher_better, filename in metric_specs:
+    for key, ylabel, higher_better, filename, _caption in _metric_specs():
         _plot_one_metric_bar(
             records,
             metric_key=key,
@@ -326,6 +565,8 @@ def _plot_metric_panels(records: list[dict[str, Any]], out_dir: Path) -> None:
             higher_better=higher_better,
             out_path=out_dir / filename,
         )
+    shutil.copy2(out_dir / "ablation_metric_cost.png", out_dir / "ablation_metric_npv.png")
+    _plot_metric_grid(records, out_dir / "ablation_metrics.png")
 
 
 def _copy_key_ablation_figures(out_dir: Path) -> None:
@@ -336,7 +577,9 @@ def _copy_key_ablation_figures(out_dir: Path) -> None:
         "ablation_metric_return.png",
         "ablation_metric_lr.png",
         "ablation_metric_risk.png",
+        "ablation_metric_cost.png",
         "ablation_metric_npv.png",
+        "ablation_metrics.png",
         "ablation_tradeoff.png",
     ]
     for name in fig_names:
@@ -357,6 +600,7 @@ def _plot_convergence(records: list[dict[str, Any]], out_path: Path) -> None:
     ax.set_title("Ablation Convergence", fontsize=_font("conv_title"))
     ax.tick_params(axis="both", labelsize=_font("conv_ticks"))
     ax.grid(True, alpha=0.25)
+    _apply_full_frame(ax, linewidth=0.9)
     ax.legend(loc="best", fontsize=_font("conv_legend"))
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,12 +609,11 @@ def _plot_convergence(records: list[dict[str, Any]], out_path: Path) -> None:
 
 
 def _plot_tradeoff(records: list[dict[str, Any]], out_path: Path) -> None:
-    fig, ax = plt.subplots(figsize=(8.2, 5.8))
     names = [str(r["name"]) for r in records]
-    npv = np.array([float(r["best_eval_holdout"]["npv"]) for r in records], dtype=float)
+    cost = np.array([float(r["best_eval_holdout"]["lcc"]) for r in records], dtype=float)
     risk = np.array([float(r["best_eval_holdout"]["risk"]) for r in records], dtype=float)
     lr = np.array([float(r["best_eval_holdout"]["lr"]) for r in records], dtype=float)
-    ret = np.array([float(r["best_eval_holdout"]["return"]) for r in records], dtype=float)
+    ret = np.array([_metric_value(r, "reported_return") for r in records], dtype=float)
 
     lr_min = float(np.min(lr))
     lr_max = float(np.max(lr))
@@ -380,8 +623,9 @@ def _plot_tradeoff(records: list[dict[str, Any]], out_path: Path) -> None:
         # Lower LR is better -> larger bubbles.
         bubble_sizes = 220.0 + 760.0 * (lr_max - lr) / (lr_max - lr_min)
 
-    sc = ax.scatter(
-        npv,
+    fig, ax = plt.subplots(figsize=(9.8, 6.6))
+    scatter_ref = ax.scatter(
+        cost,
         risk,
         s=bubble_sizes,
         c=ret,
@@ -391,26 +635,51 @@ def _plot_tradeoff(records: list[dict[str, Any]], out_path: Path) -> None:
         linewidths=0.8,
         zorder=3,
     )
+    ax.set_facecolor("#F7F7F7")
+    ax.grid(True, which="both", linestyle="--", linewidth=0.8, alpha=0.45, zorder=0)
+    _apply_full_frame(ax, linewidth=0.9)
+    ax.tick_params(axis="both", labelsize=_font("trade_ticks"))
+
+    risk_positive = risk[risk > 0.0]
+    if risk_positive.size > 0:
+        ax.set_yscale("log", base=10)
+        ax.set_ylim(max(float(np.min(risk_positive)) / 1.8, 1.0e-3), float(np.max(risk)) * 1.8)
 
     label_offsets = {
-        "baseline_full": (16, 8),
-        "no_risk_term": (18, -14),
-        "no_resilience_term": (16, 8),
-        "no_cost_term": (-98, 24),
+        "baseline_full": (16, -8),
+        "no_risk_term": (12, 8),
+        "no_resilience_term": (-14, -16),
+        "no_cost_term": (-28, 12),
         "no_pre_reinforcement": (16, 8),
+        "no_maintenance": (12, 18),
+        "no_repair": (20, -10),
+    }
+    label_align = {
+        "baseline_full": ("left", "center"),
+        "no_risk_term": ("left", "bottom"),
+        "no_resilience_term": ("right", "top"),
+        "no_cost_term": ("right", "bottom"),
+        "no_pre_reinforcement": ("left", "bottom"),
+        "no_maintenance": ("left", "bottom"),
+        "no_repair": ("left", "top"),
     }
     for i, name in enumerate(names):
         dx, dy = label_offsets.get(name, (8, 8))
+        ha, va = label_align.get(name, ("left", "bottom"))
         ax.annotate(
             _display_variant_name(name),
-            xy=(npv[i], risk[i]),
+            xy=(cost[i], risk[i]),
             xytext=(dx, dy),
             textcoords="offset points",
             fontsize=_font("trade_label"),
+            ha=ha,
+            va=va,
+            annotation_clip=False,
+            arrowprops=dict(arrowstyle="-", color="#666666", lw=0.7, alpha=0.55),
             bbox=dict(boxstyle="round,pad=0.18", facecolor="white", alpha=0.72, linewidth=0.0),
         )
 
-    cbar = fig.colorbar(sc, ax=ax, pad=0.02)
+    cbar = fig.colorbar(scatter_ref, ax=ax, pad=0.03, fraction=0.05)
     cbar.set_label("Holdout return", rotation=90, fontsize=_font("trade_cbar_label"))
     cbar.ax.tick_params(labelsize=_font("trade_cbar_ticks"))
 
@@ -429,6 +698,7 @@ def _plot_tradeoff(records: list[dict[str, Any]], out_path: Path) -> None:
         [f"LR={float(v):.2f}" for v in lr_refs],
         title="Bubble size (LR)",
         loc="upper right",
+        bbox_to_anchor=(0.96, 0.98),
         ncols=1,
         frameon=True,
         facecolor="white",
@@ -437,18 +707,11 @@ def _plot_tradeoff(records: list[dict[str, Any]], out_path: Path) -> None:
         title_fontsize=_font("trade_bubble_legend_title"),
     )
 
+    x_pad = max(2.4, float((np.max(cost) - np.min(cost)) * 0.10))
+    ax.set_xlim(float(np.min(cost) - x_pad), float(np.max(cost) + x_pad))
     ax.set_xlabel("Cost", fontsize=_font("trade_axis"))
-    ax.set_ylabel("Risk", fontsize=_font("trade_axis"))
-    ax.tick_params(axis="both", labelsize=_font("trade_ticks"))
+    ax.set_ylabel("Risk (log)", fontsize=_font("trade_axis"))
     ax.set_title("Risk-Cost Trade-off on Holdout Episodes", fontsize=_font("trade_title"), pad=7)
-    ax.set_facecolor("#F7F7F7")
-    ax.grid(True, linestyle="--", linewidth=0.8, alpha=0.45, zorder=0)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
-    x_pad = max(2.4, float((np.max(npv) - np.min(npv)) * 0.10))
-    y_pad = max(0.2, float((np.max(risk) - np.min(risk)) * 0.10))
-    ax.set_xlim(float(np.min(npv) - x_pad), float(np.max(npv) + x_pad))
-    ax.set_ylim(max(0.0, float(np.min(risk) - y_pad)), float(np.max(risk) + y_pad))
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=260, bbox_inches="tight")
@@ -457,9 +720,10 @@ def _plot_tradeoff(records: list[dict[str, Any]], out_path: Path) -> None:
 
 def _build_report(records: list[dict[str, Any]], out_dir: Path, settings: dict[str, Any]) -> None:
     baseline = records[0]["best_eval_holdout"]
+    baseline_return = _metric_value(records[0], "reported_return")
     rank = sorted(
         records,
-        key=lambda r: float(r["best_eval_holdout"]["return"]),
+        key=lambda r: _metric_value(r, "reported_return"),
         reverse=True,
     )
     lines: list[str] = []
@@ -473,46 +737,48 @@ def _build_report(records: list[dict[str, Any]], out_dir: Path, settings: dict[s
     lines.append(f"- elite_frac: `{settings['elite_frac']}`")
     lines.append(f"- eval_episodes: `{settings['eval_episodes']}`")
     lines.append(f"- holdout_episodes: `{settings['holdout_episodes']}`")
+    lines.append("- Return is reported with the paper-comparable raw scalarisation of LR, risk, and cost under each ablation weight setting.")
     lines.append("")
     lines.append("## Holdout Metrics")
     lines.append("")
-    lines.append("| Variant | Return | LR | Risk | NPV | Min F | Feasible |")
+    lines.append("| Variant | Return | LR | Risk | Cost | Min F | Feasible |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|")
     for rec in records:
         m = rec["best_eval_holdout"]
         lines.append(
-            f"| {rec['name']} | {float(m['return']):.4f} | {float(m['lr']):.3f} | {float(m['risk']):.3f} | {float(m['npv']):.2f} | {float(m['min_f']):.3f} | {float(m['feasible_frac']):.3f} |"
+            f"| {rec['name']} | {_metric_value(rec, 'reported_return'):.4f} | {float(m['lr']):.3f} | {float(m['risk']):.3f} | {float(m['lcc']):.2f} | {float(m['min_f']):.3f} | {float(m['feasible_frac']):.3f} |"
         )
     lines.append("")
     lines.append("## Relative To Baseline")
     lines.append("")
-    lines.append("| Variant | dReturn | dLR | dRisk | dNPV |")
+    lines.append("| Variant | dReturn | dLR | dRisk | dCost |")
     lines.append("|---|---:|---:|---:|---:|")
     for rec in records[1:]:
         m = rec["best_eval_holdout"]
         lines.append(
-            f"| {rec['name']} | {float(m['return']) - float(baseline['return']):+.4f} | {float(m['lr']) - float(baseline['lr']):+.3f} | {float(m['risk']) - float(baseline['risk']):+.3f} | {float(m['npv']) - float(baseline['npv']):+.2f} |"
+            f"| {rec['name']} | {_metric_value(rec, 'reported_return') - baseline_return:+.4f} | {float(m['lr']) - float(baseline['lr']):+.3f} | {float(m['risk']) - float(baseline['risk']):+.3f} | {float(m['lcc']) - float(baseline['lcc']):+.2f} |"
         )
     lines.append("")
     lines.append("## Quick Findings")
     lines.append("")
     lines.append(
-        f"- Best holdout return: `{rank[0]['name']}` ({float(rank[0]['best_eval_holdout']['return']):.4f})."
+        f"- Best holdout return: `{rank[0]['name']}` ({_metric_value(rank[0], 'reported_return'):.4f})."
     )
     worst_risk = max(records, key=lambda r: float(r["best_eval_holdout"]["risk"]))
     best_risk = min(records, key=lambda r: float(r["best_eval_holdout"]["risk"]))
     lines.append(
         f"- Lowest risk: `{best_risk['name']}` ({float(best_risk['best_eval_holdout']['risk']):.3f}); highest risk: `{worst_risk['name']}` ({float(worst_risk['best_eval_holdout']['risk']):.3f})."
     )
-    best_cost = min(records, key=lambda r: float(r["best_eval_holdout"]["npv"]))
-    worst_cost = max(records, key=lambda r: float(r["best_eval_holdout"]["npv"]))
+    best_cost = min(records, key=lambda r: float(r["best_eval_holdout"]["lcc"]))
+    worst_cost = max(records, key=lambda r: float(r["best_eval_holdout"]["lcc"]))
     lines.append(
-        f"- Lowest NPV: `{best_cost['name']}` ({float(best_cost['best_eval_holdout']['npv']):.2f}); highest NPV: `{worst_cost['name']}` ({float(worst_cost['best_eval_holdout']['npv']):.2f})."
+        f"- Lowest cost: `{best_cost['name']}` ({float(best_cost['best_eval_holdout']['lcc']):.2f}); highest cost: `{worst_cost['name']}` ({float(worst_cost['best_eval_holdout']['lcc']):.2f})."
     )
     lines.append("")
     lines.append("## Figures")
     lines.append("")
-    lines.append("- `ablation_metric_return.png`, `ablation_metric_lr.png`, `ablation_metric_risk.png`, `ablation_metric_npv.png`: metric-wise bar comparisons.")
+    lines.append("- `ablation_metric_return.png`, `ablation_metric_lr.png`, `ablation_metric_risk.png`, `ablation_metric_cost.png`: metric-wise bar comparisons.")
+    lines.append("- `ablation_metrics.png`: 2x2 metric panel.")
     lines.append("- `ablation_convergence.png`: best-of-iteration return curves.")
     lines.append("- `ablation_tradeoff.png`: risk-cost trade-off scatter.")
     lines.append("")
@@ -522,34 +788,41 @@ def _build_report(records: list[dict[str, Any]], out_dir: Path, settings: dict[s
 def run_ablation(
     *,
     out_root: Path,
-    iterations: int,
-    population: int,
-    eval_episodes: int,
+    iterations: int | None,
+    population: int | None,
+    eval_episodes: int | None,
     holdout_episodes: int,
-    elite_frac: float,
-    base_seed: int,
+    elite_frac: float | None,
+    base_seed: int | None,
+    base_config_path: Path | None = None,
 ) -> Path:
     run_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     out_dir = out_root
     out_dir.mkdir(parents=True, exist_ok=True)
     logger = _make_logger(out_dir / "ablation.log")
 
-    base_cfg = _base_cfg()
+    base_cfg, source_cem_cfg, source_config_path = _base_cfg(base_config_path)
+    iterations_v = int(source_cem_cfg.iterations if iterations is None else iterations)
+    population_v = int(source_cem_cfg.population if population is None else population)
+    eval_episodes_v = int(source_cem_cfg.eval_episodes if eval_episodes is None else eval_episodes)
+    elite_frac_v = float(source_cem_cfg.elite_frac if elite_frac is None else elite_frac)
+    base_seed_v = int(source_cem_cfg.seed if base_seed is None else base_seed)
+
     variants = _variants(base_cfg)
     cem_cfg = tl.CEMConfig(
-        iterations=int(iterations),
-        population=int(population),
-        elite_frac=float(elite_frac),
-        eval_episodes=int(eval_episodes),
-        seed=int(base_seed),
+        iterations=iterations_v,
+        population=population_v,
+        elite_frac=elite_frac_v,
+        eval_episodes=eval_episodes_v,
+        seed=base_seed_v,
         plot_first_n=0,
         plot_interval=9999,
     )
 
-    logger.info("Ablation setup | out_dir=%s", str(out_dir))
+    logger.info("Ablation setup | out_dir=%s base_config=%s", str(out_dir), str(source_config_path))
     records: list[dict[str, Any]] = []
     for idx, variant in enumerate(variants):
-        seed = int(base_seed + idx * 1000)
+        seed = int(base_seed_v + idx * 1000)
         rec = _run_one_variant(
             variant=variant,
             cem_cfg=cem_cfg,
@@ -559,6 +832,8 @@ def run_ablation(
             logger=logger,
         )
         records.append(rec)
+    for rec in records:
+        _ensure_reported_return(rec)
 
     _plot_metric_panels(records, out_dir)
     _plot_convergence(records, out_dir / "ablation_convergence.png")
@@ -568,12 +843,13 @@ def run_ablation(
     summary_payload = {
         "run_time": run_time,
         "settings": {
-            "iterations": int(iterations),
-            "population": int(population),
-            "elite_frac": float(elite_frac),
-            "eval_episodes": int(eval_episodes),
+            "base_config": str(source_config_path),
+            "iterations": iterations_v,
+            "population": population_v,
+            "elite_frac": elite_frac_v,
+            "eval_episodes": eval_episodes_v,
             "holdout_episodes": int(holdout_episodes),
-            "base_seed": int(base_seed),
+            "base_seed": base_seed_v,
         },
         "records": records,
     }
@@ -586,10 +862,10 @@ def run_ablation(
         out_dir,
         {
             "run_time": run_time,
-            "iterations": int(iterations),
-            "population": int(population),
-            "elite_frac": float(elite_frac),
-            "eval_episodes": int(eval_episodes),
+            "iterations": iterations_v,
+            "population": population_v,
+            "elite_frac": elite_frac_v,
+            "eval_episodes": eval_episodes_v,
             "holdout_episodes": int(holdout_episodes),
         },
     )
@@ -608,6 +884,10 @@ def redraw_only_from_results(*, out_root: Path, results_json: Path | None = None
     records = payload.get("records", [])
     if not isinstance(records, list) or len(records) == 0:
         raise ValueError(f"No records found in results JSON: {src}")
+    for rec in records:
+        if isinstance(rec, dict):
+            _ensure_reported_return(rec)
+    payload["records"] = records
 
     settings = payload.get("settings", {})
     run_time = str(payload.get("run_time", "plot_only"))
@@ -627,6 +907,10 @@ def redraw_only_from_results(*, out_root: Path, results_json: Path | None = None
             "holdout_episodes": int(settings.get("holdout_episodes", 0)),
         },
     )
+    (out_dir / "ablation_all_results.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return out_dir
 
 
@@ -645,12 +929,18 @@ def main() -> None:
         default="",
         help="Path to existing ablation_all_results.json (used with --plot-only).",
     )
-    parser.add_argument("--iterations", type=int, default=28)
-    parser.add_argument("--population", type=int, default=28)
-    parser.add_argument("--eval-episodes", type=int, default=10)
-    parser.add_argument("--holdout-episodes", type=int, default=50)
-    parser.add_argument("--elite-frac", type=float, default=0.25)
-    parser.add_argument("--seed", type=int, default=20260315)
+    parser.add_argument(
+        "--base-config",
+        type=str,
+        default="",
+        help="Normalized baseline case config. Default: normalized_cases/case1_baseline_normalized.json.",
+    )
+    parser.add_argument("--iterations", type=int, default=0)
+    parser.add_argument("--population", type=int, default=0)
+    parser.add_argument("--eval-episodes", type=int, default=0)
+    parser.add_argument("--holdout-episodes", type=int, default=100)
+    parser.add_argument("--elite-frac", type=float, default=-1.0)
+    parser.add_argument("--seed", type=int, default=-1)
     args = parser.parse_args()
 
     script_dir = Path(__file__).resolve().parent
@@ -667,12 +957,13 @@ def main() -> None:
 
     run_dir = run_ablation(
         out_root=out_root,
-        iterations=args.iterations,
-        population=args.population,
-        eval_episodes=args.eval_episodes,
+        iterations=None if int(args.iterations) <= 0 else int(args.iterations),
+        population=None if int(args.population) <= 0 else int(args.population),
+        eval_episodes=None if int(args.eval_episodes) <= 0 else int(args.eval_episodes),
         holdout_episodes=args.holdout_episodes,
-        elite_frac=args.elite_frac,
-        base_seed=args.seed,
+        elite_frac=None if float(args.elite_frac) < 0.0 else float(args.elite_frac),
+        base_seed=None if int(args.seed) < 0 else int(args.seed),
+        base_config_path=Path(args.base_config).resolve() if str(args.base_config).strip() else None,
     )
     print(str(run_dir))
 

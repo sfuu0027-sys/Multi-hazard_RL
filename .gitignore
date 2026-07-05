@@ -1,19 +1,45 @@
-# Results and Figures
+# Generated figures and rendered assets
 *.png
 *.jpg
 *.jpeg
 *.gif
 *.bmp
 *.svg
-# *.pdf
 *.eps
 *.tif
 *.tiff
 
-# Logs
+# Logs and runtime output
 *.log
 logs/
 log/
+RL_Code/log/
+RL_Code/log_*/
+
+# RL experiment artifacts
+RL_Code/ablation_results/
+RL_Code/fig/
+RL_Code/fig_*/
+RL_Code/fig_normalized/
+RL_Code/old/
+RL_Code/cem_results_norm*.json
+RL_Code/iter_trajectories_norm*.json
+
+# Model checkpoints and binary outputs
+checkpoints/
+outputs/
+results/
+*.pth
+*.pt
+*.pkl
+*.h5
+*.hdf5
+
+# Data and exported workbooks
+*.csv
+*.xlsx
+*.parquet
+*.feather
 
 # LaTeX auxiliary files
 *.aux
@@ -36,7 +62,7 @@ log/
 *.ps
 _minted*/
 
-# Python
+# Python cache and build products
 __pycache__/
 *.py[cod]
 *$py.class
@@ -57,48 +83,37 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-
-# Jupyter Notebook
 .ipynb_checkpoints/
 
-# IDE
+# Local notes and markdown drafts
+*.md
+!README.md
+!TODO.md
+
+# IDE and OS files
 .idea/
 .vscode/
+.trae/
 *.swp
 *.swo
 *~
-
-# OS
 .DS_Store
 Thumbs.db
 
-# Model checkpoints and outputs
-checkpoints/
-outputs/
-results/
-*.pth
-*.pt
-*.pkl
-*.h5
-*.hdf5
-
-# Data files (large)
-*.csv
-*.xlsx
-*.parquet
-*.feather
-
-# Temporary files
+# Archives and temporary files
 *.tmp
 *.temp
 *.bak
 *.zip
+backups/
 
-Prompt.md
-RL_Code/ablation_results
+# Project-local scratch/reference material
 AGENTS.md
 Test/
 Paper/
+prompt.assets/
+reference/
+伪代码/
 export_figure4.py
 extract_lifecycle_pdf.py
 Figure4_page_11_caption_snippet.txt
@@ -106,16 +121,4 @@ Figure4_page_12_caption_snippet.txt
 Lifecycle management .extracted.txt
 Lifecycle management .pdf
 Lifecycle management .summary.json
-.trae/
-backups/
-prompt.assets/
-reference/
-RL_Code/fig_0_0.2_0.4/
-RL_Code/RLNotes.md
-伪代码/Word安装方法.md
-伪代码/
-Improvement.md
 Lifecycle management.txt
-贴现策略.md
-Note.md
-.git/

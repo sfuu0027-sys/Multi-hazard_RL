@@ -1,0 +1,120 @@
+{
+  "io": {
+    "fig_dir": "fig_normalized",
+    "out_json": "cem_results_norm_case1_baseline.json",
+    "iter_trajectories": "iter_trajectories_norm_case1_baseline.json",
+    "log_dir": "log_normalized"
+  },
+  "lifecycle": {
+    "horizon_years": 100,
+    "dt_years": 1.0,
+    "record_dt_years": 0.25,
+    "maintenance_interval_years": 10,
+    "lambda_eq_per_year": 0.02857142857142857,
+    "lambda_fire_per_year": 0.29239766081871343,
+    "hazard_intensities": [
+      0.1,
+      0.2,
+      0.3
+    ],
+    "hazard_intensity_probs": [
+      0.6,
+      0.3,
+      0.1
+    ],
+    "eq_intensities": [
+      0.1,
+      0.4,
+      0.7
+    ],
+    "eq_intensity_probs": null,
+    "fire_intensities": [
+      0.1,
+      0.2,
+      0.3
+    ],
+    "fire_intensity_probs": null,
+    "f_crit": 0.7,
+    "f_1": 0.5,
+    "f_2": 0.3,
+    "c_1": 1.0,
+    "c_2": 4.0,
+    "c_3": 10.0,
+    "pre_cost_options": [
+      10.0,
+      20.0,
+      30.0
+    ],
+    "pre_fcrit_multipliers": [
+      1.0,
+      0.9,
+      0.8
+    ],
+    "pre_hazard_damage_multipliers": [
+      1.0,
+      0.9,
+      0.8
+    ],
+    "pre_deterioration_multipliers": [
+      1.0,
+      0.9,
+      0.8
+    ],
+    "deterioration_model": "weibull",
+    "det_alpha_T_levels": [
+      0.75,
+      0.5,
+      0.25
+    ],
+    "det_tau_years": 55.0,
+    "det_k": 2.2,
+    "det_sigma": 0.0,
+    "base_deterioration_rate": 0.03,
+    "maint_costs": [
+      0.0,
+      0.8,
+      2.0
+    ],
+    "maint_rate_multipliers": [
+      1.0,
+      0.7,
+      0.45
+    ],
+    "repair_costs": [
+      0.0,
+      3.0,
+      10.0
+    ],
+    "repair_recovery_deltas": [
+      0.0,
+      0.25,
+      0.5
+    ],
+    "hazard_transition_durations": [
+      0.5,
+      1.0,
+      1.5
+    ],
+    "w_lr": 0.3333333333333333,
+    "w_risk": 0.3333333333333333,
+    "w_cost": 0.3333333333333333,
+    "discount_rate": 0.03,
+    "objective_cost_metric": "lcc",
+    "objective_normalization": "reference",
+    "lr_ref": 10.80476706170614,
+    "risk_ref": 1.7860000000000003,
+    "cost_ref": 8.856626666666669,
+    "floor_ref": 1.0,
+    "w_floor": 0.0,
+    "repair_stop_years": 0.0
+  },
+  "cem": {
+    "iterations": 200,
+    "population": 80,
+    "elite_frac": 0.2,
+    "eval_episodes": 30,
+    "seed": 20260301,
+    "plot_first_n": 30,
+    "plot_interval": 2
+  }
+}

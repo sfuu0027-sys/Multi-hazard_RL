@@ -106,6 +106,13 @@ class LifecycleConfig:
     discount_rate: float = 0.03
     # Cost metric used in objective: "lcc" (discount-neutral) or "npv".
     objective_cost_metric: str = "lcc"
+    # Objective aggregation mode: "raw" preserves the original scalarisation;
+    # "reference" divides LR, risk, and selected cost by fixed reference values.
+    objective_normalization: str = "raw"
+    lr_ref: float = 1.0
+    risk_ref: float = 1.0
+    cost_ref: float = 1.0
+    floor_ref: float = 1.0
     w_floor: float = 0.0
     repair_stop_years: float = 0.0
 
@@ -240,6 +247,78 @@ def _avg_discount_factor(discount_rate: float, t0_years: float, t1_years: float)
     e0 = math.exp(-r * float(t0_years))
     e1 = math.exp(-r * float(t1_years))
     return float((e0 - e1) / (r * dt))
+
+
+def _objective_uses_reference_normalization(cfg: LifecycleConfig) -> bool:
+    mode = str(cfg.objective_normalization).strip().lower()
+    return mode in {"reference", "ref", "normalized", "normalised"}
+
+
+def _safe_ref(x: float) -> float:
+    v = abs(float(x))
+    if not math.isfinite(v) or v <= 1.0e-12:
+        return 1.0
+    return v
+
+
+def _objective_cost_value(cfg: LifecycleConfig, *, lcc: float, npv: float) -> float:
+    cost_metric = str(cfg.objective_cost_metric).strip().lower()
+    return float(npv if cost_metric == "npv" else lcc)
+
+
+def _objective_return_value(
+    cfg: LifecycleConfig,
+    *,
+    lr: float,
+    risk: float,
+    lcc: float,
+    npv: float,
+    floor_violation: float,
+) -> float:
+    cost_value = _objective_cost_value(cfg, lcc=lcc, npv=npv)
+    lr_term = float(lr)
+    risk_term = float(risk)
+    cost_term = float(cost_value)
+    floor_term = float(floor_violation)
+    if _objective_uses_reference_normalization(cfg):
+        lr_term /= _safe_ref(cfg.lr_ref)
+        risk_term /= _safe_ref(cfg.risk_ref)
+        cost_term /= _safe_ref(cfg.cost_ref)
+        floor_term /= _safe_ref(cfg.floor_ref)
+    return float(-(cfg.w_lr * lr_term +
+                   cfg.w_risk * risk_term +
+                   cfg.w_cost * cost_term +
+                   cfg.w_floor * floor_term))
+
+
+def _objective_cost_tensor(cfg: LifecycleConfig, *, lcc: Any, npv: Any) -> Any:
+    cost_metric = str(cfg.objective_cost_metric).strip().lower()
+    return npv if cost_metric == "npv" else lcc
+
+
+def _objective_return_tensor(
+    cfg: LifecycleConfig,
+    *,
+    lr: Any,
+    risk: Any,
+    lcc: Any,
+    npv: Any,
+    floor_violation: Any,
+) -> Any:
+    cost_value = _objective_cost_tensor(cfg, lcc=lcc, npv=npv)
+    lr_term = lr
+    risk_term = risk
+    cost_term = cost_value
+    floor_term = floor_violation
+    if _objective_uses_reference_normalization(cfg):
+        lr_term = lr_term / _safe_ref(cfg.lr_ref)
+        risk_term = risk_term / _safe_ref(cfg.risk_ref)
+        cost_term = cost_term / _safe_ref(cfg.cost_ref)
+        floor_term = floor_term / _safe_ref(cfg.floor_ref)
+    return -(float(cfg.w_lr) * lr_term +
+             float(cfg.w_risk) * risk_term +
+             float(cfg.w_cost) * cost_term +
+             float(cfg.w_floor) * floor_term)
 
 
 def _lr_increment_pdf(
@@ -512,12 +591,14 @@ def simulate_episode(cfg: LifecycleConfig, params: PolicyParams, seed: int, *, r
         cumulative_cost.append(float(cost))
 
     lcc = cost
-    cost_metric = str(cfg.objective_cost_metric).strip().lower()
-    cost_for_objective = npv if cost_metric == "npv" else lcc
-    return_value = -(cfg.w_lr * lr +
-                     cfg.w_risk * risk +
-                     cfg.w_cost * cost_for_objective +
-                     cfg.w_floor * floor_violation)
+    return_value = _objective_return_value(
+        cfg,
+        lr=lr,
+        risk=risk,
+        lcc=lcc,
+        npv=npv,
+        floor_violation=floor_violation,
+    )
 
     return EpisodeResult(
         t_years=t_years,
@@ -928,14 +1009,14 @@ def _evaluate_population_torch(
             torch.clamp(f2 - f_mid, min=0.0) * dt_seg
         min_f = torch.minimum(min_f, f1)
 
-    w_lr = float(cfg.w_lr)
-    w_risk = float(cfg.w_risk)
-    w_cost = float(cfg.w_cost)
-    w_floor = float(cfg.w_floor)
-    cost_metric = str(cfg.objective_cost_metric).strip().lower()
-    cost_for_objective = npv if cost_metric == "npv" else cost
-    ret = -(w_lr * lr + w_risk * risk + w_cost *
-            cost_for_objective + w_floor * floor_violation)
+    ret = _objective_return_tensor(
+        cfg,
+        lr=lr,
+        risk=risk,
+        lcc=cost,
+        npv=npv,
+        floor_violation=floor_violation,
+    )
 
     ret = ret.view(pop_n, ep_n).mean(dim=1).detach().cpu().numpy()
     lr_m = lr.view(pop_n, ep_n).mean(dim=1).detach().cpu().numpy()
@@ -1731,6 +1812,12 @@ def _plot_cost_over_time_by_iteration(
             ax.set_yticklabels([str(int(v)) for v in tick_vals])
             ax.set_ylim(0.0, 110.0)
             major_ticks = np.array(tick_vals, dtype=float)
+        elif case_key == "case3c":
+            tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 110.0]
+            ax.set_yticks(tick_vals)
+            ax.set_yticklabels([str(int(v)) for v in tick_vals])
+            ax.set_ylim(0.0, 110.0)
+            major_ticks = np.array(tick_vals, dtype=float)
         else:
             major_ticks = np.array(ax.get_yticks(), dtype=float)
             tick_vals = sorted(
@@ -1786,7 +1873,18 @@ def _plot_cost_over_time_by_iteration(
         if case_key == "case3b":
             yoff_best -= 3.0
         elif case_key == "case3c":
-            yoff_base -= 4.0
+            # Case 3c has two terminal cost labels close to the top of the
+            # axis; place them in the left margin bands to avoid overlap.
+            ylim0, ylim1 = ax.get_ylim()
+            yspan = float(max(1.0, float(ylim1) - float(ylim0)))
+            if y1_best >= y1_base:
+                ylab_best = float(ylim1) - 0.075 * yspan
+                ylab_base = float(ylim1) - 0.175 * yspan
+            else:
+                ylab_base = float(ylim1) - 0.045 * yspan
+                ylab_best = float(ylim1) - 0.175 * yspan
+            yoff_base = 0.0
+            yoff_best = 0.0
 
         ax.annotate(f"{y1_base:.1f}", xy=(x_label_anchor_ax, ylab_base), xycoords=ax.get_yaxis_transform(),
                     xytext=(0.0, yoff_base), textcoords="offset points", ha="left", va="center",
@@ -2322,6 +2420,15 @@ def _plot_rl_eval_combined(
 def _coerce_lifecycle_config_dict(d: dict[str, Any]) -> dict[str, Any]:
     tuple_fields = {
         "hazard_intensity_probs",
+        "hazard_intensities",
+        "eq_intensities",
+        "eq_intensity_probs",
+        "fire_intensities",
+        "fire_intensity_probs",
+        "pre_cost_options",
+        "pre_fcrit_multipliers",
+        "pre_hazard_damage_multipliers",
+        "pre_deterioration_multipliers",
         "det_alpha_T_levels",
         "maint_costs",
         "maint_rate_multipliers",
@@ -2347,15 +2454,6 @@ def _coerce_lifecycle_config_dict(d: dict[str, Any]) -> dict[str, Any]:
 
     out.pop("pre_f0_options", None)
     out.pop("w_c3", None)
-    out.pop("hazard_intensities", None)
-    out.pop("eq_intensities", None)
-    out.pop("eq_intensity_probs", None)
-    out.pop("fire_intensities", None)
-    out.pop("fire_intensity_probs", None)
-    out.pop("pre_cost_options", None)
-    out.pop("pre_fcrit_multipliers", None)
-    out.pop("pre_deterioration_multipliers", None)
-    out.pop("pre_hazard_damage_multipliers", None)
 
     allowed = set(LifecycleConfig.__dataclass_fields__.keys())
     out = {k: v for k, v in out.items() if k in allowed}
