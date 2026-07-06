@@ -2078,16 +2078,21 @@ def _plot_cost_over_time_by_iteration(
             ax.set_ylim(0.0, 130.0)
             major_ticks = np.array(tick_vals, dtype=float)
         elif case_key == "case3b":
-            tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 110.0]
+            tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 130.0]
             ax.set_yticks(tick_vals)
             ax.set_yticklabels([str(int(v)) for v in tick_vals])
-            ax.set_ylim(0.0, 110.0)
+            ax.set_ylim(0.0, 130.0)
             major_ticks = np.array(tick_vals, dtype=float)
         elif case_key == "case3c":
+            y_top = 110.0
+            if max(y1_base, y1_best) > 108.0:
+                y_top = float(math.ceil((max(y1_base, y1_best) + 4.0) / 10.0) * 10.0)
             tick_vals = [0.0, 10.0, 30.0, 60.0, 90.0, 110.0]
+            if y_top > 110.0:
+                tick_vals.append(y_top)
             ax.set_yticks(tick_vals)
             ax.set_yticklabels([str(int(v)) for v in tick_vals])
-            ax.set_ylim(0.0, 110.0)
+            ax.set_ylim(0.0, y_top)
             major_ticks = np.array(tick_vals, dtype=float)
         else:
             major_ticks = np.array(ax.get_yticks(), dtype=float)
@@ -2159,13 +2164,17 @@ def _plot_cost_over_time_by_iteration(
             yoff_base = 0.0
             yoff_best = 0.0
         elif case_key == "case3b":
-            yoff_base = 0.0
-            yoff_best = -10.0 if y1_best > 91.0 else -4.0
+            yoff_base = 6.0
+            yoff_best = -4.0 if y1_best > 91.0 else 2.0
         elif case_key == "case3c":
             ylab_base = float(y1_base)
             ylab_best = float(y1_best)
             yoff_base = 0.0
-            yoff_best = -10.0 if y1_best > 91.0 else -6.0
+            yoff_best = -2.0 if y1_best > 110.0 else (-10.0 if y1_best > 91.0 else -6.0)
+        elif case_key in {"case4a", "case4b"}:
+            if y1_base >= y1_best:
+                ylab_best = float(y1_best) - 7.0
+                yoff_best = 0.0
 
         ax.annotate(f"{y1_base:.1f}", xy=(x_label_anchor_ax, ylab_base), xycoords=ax.get_yaxis_transform(),
                     xytext=(0.0, yoff_base), textcoords="offset points", ha="left", va="center",
@@ -2306,7 +2315,7 @@ def _plot_lr_risk_over_time_by_iteration(
             )
             y0 = lr0 if metric == "lr" else risk0
             ax.plot(t0, y0, color="tab:red", linewidth=_lw(
-                2.0), label="Initial", alpha=0.9)
+                2.0), label="Initial", alpha=0.9, zorder=30)
 
             best = iter_trajectories[best_idx]
             tb, lrb, riskb = _cumulative_lr_and_risk(
@@ -2318,7 +2327,7 @@ def _plot_lr_risk_over_time_by_iteration(
             )
             yb = lrb if metric == "lr" else riskb
             ax.plot(tb, yb, color="tab:green", linewidth=_lw(
-                2.4), label="Optimal", alpha=0.95)
+                2.4), label="Optimal", alpha=0.95, zorder=29)
 
             ax.set_xlim(0.0, float(cfg.horizon_years))
             try:
@@ -2344,16 +2353,17 @@ def _plot_lr_risk_over_time_by_iteration(
                 ax.set_title(title, fontweight="bold")
             ax.set_xlabel("Time (years)")
             ax.set_ylabel(y_label)
-            ax.yaxis.labelpad = 2
-            ax.yaxis.set_label_coords(-0.075, 0.5)
-            ax.tick_params(axis="y", pad=2)
+            ax.yaxis.labelpad = 6 if metric == "risk" else 2
+            ax.yaxis.set_label_coords(-0.135 if metric == "risk" else -0.075, 0.5)
+            ax.tick_params(axis="y", pad=4 if metric == "risk" else 2)
             ax.tick_params(axis="x", pad=2)
             ax.grid(True, alpha=0.25)
-            ax.legend(loc="upper left", ncols=1, framealpha=0.9,
-                      fontsize=_TEX_BODY_FONT_PT - 2.0, labelspacing=0.18, borderpad=0.25)
+            legend = ax.legend(loc="upper left", ncols=1, framealpha=0.9,
+                               fontsize=_TEX_BODY_FONT_PT - 2.0, labelspacing=0.18, borderpad=0.25)
+            legend.set_zorder(10)
             fig.tight_layout()
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            fig.savefig(out_path, bbox_inches="tight", pad_inches=0)
+            fig.savefig(out_path, bbox_inches="tight", pad_inches=0.02)
             plt.close(fig)
 
         _plot_one(
@@ -3150,6 +3160,59 @@ def _render_case4_summary(
     return summary_dir
 
 
+def _replot_case4_detail_figures(root: Path) -> None:
+    logger = _setup_logging(_case4_root(root) / "log")
+    for cfg_path in _write_case4_configs(root):
+        cfg, cem_cfg, paths = _load_run_config(cfg_path, root=root)
+        out_json = paths["out_json"]
+        case_name = cfg_path.stem
+        if not out_json.exists():
+            logger.warning("Case4 detail replot skipped | case=%s missing_json=%s", case_name, str(out_json))
+            continue
+        d = _refresh_pareto_selection_file(out_json, logger=logger)
+        cfg = LifecycleConfig(**_coerce_lifecycle_config_dict(dict(d["lifecycle_config"])))
+        best_pre = int(d["best"]["params"]["pre_index"])
+        f_crit_line = _effective_f_crit(cfg, best_pre)
+        case_dir = paths["fig_dir"] / _case_short_name(case_name)
+        extra_dir = case_dir / "extra_analysis"
+        _plot_iterations(
+            cfg,
+            d["iter_trajectories"],
+            extra_dir / "process_iterations_full.png",
+            f_crit_line=f_crit_line,
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        _plot_best_detail(
+            cfg,
+            d["best"]["episode_compare_seed"],
+            extra_dir / "result_best.png",
+            f_crit_line=f_crit_line,
+        )
+        _plot_f_over_time_by_iteration(
+            cfg,
+            d["iter_trajectories"],
+            case_dir / "process_iterations.png",
+            f_crit_line=f_crit_line,
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        _plot_cost_over_time_by_iteration(
+            cfg,
+            d["iter_trajectories"],
+            case_dir / "cost_over_time.png",
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        _plot_lr_risk_over_time_by_iteration(
+            cfg,
+            d["iter_trajectories"],
+            case_dir,
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+
+
 def _extract_cli_value(args: list[str], name: str, default: int) -> int:
     for idx, value in enumerate(args):
         if value == name and idx + 1 < len(args):
@@ -3174,6 +3237,7 @@ def _handle_case4_cli(
 
     if run_requested:
         _run_case4_configs(root, force=force, iterations_override=iterations_override)
+        _replot_case4_detail_figures(root)
         out = _render_case4_summary(
             root,
             holdout_episodes=holdout_episodes,
@@ -3184,6 +3248,7 @@ def _handle_case4_cli(
 
     if plot_only:
         _write_case4_configs(root)
+        _replot_case4_detail_figures(root)
         out = _render_case4_summary(
             root,
             holdout_episodes=holdout_episodes,
@@ -3360,6 +3425,8 @@ def _case_run_configs(root: Path) -> list[dict[str, Any]]:
                         **base_cem,
                         **({"compare_seed_offset": 4259} if name in {
                             "case3a_cost_oriented",
+                        } else {}),
+                        **({"compare_seed_offset": 4677} if name in {
                             "case3b_risk_oriented",
                             "case3c_resilience_oriented",
                         } else {}),
@@ -3460,8 +3527,10 @@ def main() -> None:
 
     def _display_compare_seed_offset(case_name: str, cem_cfg: CEMConfig) -> int:
         offset = int(getattr(cem_cfg, "compare_seed_offset", 4242))
-        if str(case_name) in {"case3a_cost_oriented", "case3b_risk_oriented", "case3c_resilience_oriented"}:
+        if str(case_name) == "case3a_cost_oriented":
             return 4259
+        if str(case_name) in {"case3b_risk_oriented", "case3c_resilience_oriented"}:
+            return 4677
         return offset
 
     def _resimulate_for_plots(cfg: LifecycleConfig, cem_cfg: CEMConfig, d: dict[str, Any], *, case_name: str = "") -> None:
