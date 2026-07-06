@@ -21,9 +21,19 @@ RL_Code/ablation_results/
 RL_Code/fig/
 RL_Code/fig_*/
 RL_Code/fig_normalized/
+RL_Code/lcc_rerun/
 RL_Code/old/
 RL_Code/cem_results_norm*.json
 RL_Code/iter_trajectories_norm*.json
+RL_Code/cem_results*.json
+RL_Code/iter_trajectories*.json
+RL_Code/*_results.json
+RL_Code/*_trajectories*.json
+
+# Generated review/rendered document outputs
+RL_Code/Review/_render*/
+RL_Code/Review/*.pdf
+RL_Code/Review/*.docx
 
 # Model checkpoints and binary outputs
 checkpoints/

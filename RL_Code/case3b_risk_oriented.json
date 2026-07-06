@@ -1,9 +1,9 @@
 {
   "io": {
-    "fig_dir": "fig",
-    "out_json": "cem_results_case3b_risk_oriented.json",
-    "iter_trajectories": "iter_trajectories_case3b_risk_oriented.json",
-    "log_dir": "log"
+    "fig_dir": "lcc_rerun/case3b_risk_oriented/fig",
+    "out_json": "lcc_rerun/case3b_risk_oriented/cem_results_case3b_risk_oriented.json",
+    "iter_trajectories": "lcc_rerun/case3b_risk_oriented/iter_trajectories_case3b_risk_oriented.json",
+    "log_dir": "lcc_rerun/case3b_risk_oriented/log"
   },
   "lifecycle": {
     "horizon_years": 100,
@@ -58,7 +58,11 @@
     "lambda_fire_per_year": 0.29239766081871343,
     "w_lr": 0.15,
     "w_risk": 0.7,
-    "w_cost": 0.15
+    "w_cost": 0.15,
+    "objective_normalization": "reference",
+    "lr_ref": 10.296414878703919,
+    "risk_ref": 1.676,
+    "cost_ref": 4.486480000000001
   },
   "cem": {
     "iterations": 200,

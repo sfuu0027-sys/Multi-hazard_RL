@@ -1,9 +1,9 @@
 {
   "io": {
-    "fig_dir": "fig",
-    "out_json": "cem_results_case2a_fire_dominant.json",
-    "iter_trajectories": "iter_trajectories_case2a_fire_dominant.json",
-    "log_dir": "log"
+    "fig_dir": "lcc_rerun/case2a_fire_dominant/fig",
+    "out_json": "lcc_rerun/case2a_fire_dominant/cem_results_case2a_fire_dominant.json",
+    "iter_trajectories": "lcc_rerun/case2a_fire_dominant/iter_trajectories_case2a_fire_dominant.json",
+    "log_dir": "lcc_rerun/case2a_fire_dominant/log"
   },
   "lifecycle": {
     "horizon_years": 100,
@@ -58,7 +58,11 @@
     "lambda_fire_per_year": 0.5847953216374269,
     "w_lr": 0.3333333333333333,
     "w_risk": 0.3333333333333333,
-    "w_cost": 0.3333333333333333
+    "w_cost": 0.3333333333333333,
+    "objective_normalization": "reference",
+    "lr_ref": 10.917178791774498,
+    "risk_ref": 1.4888333333333335,
+    "cost_ref": 5.654133333333335
   },
   "cem": {
     "iterations": 200,

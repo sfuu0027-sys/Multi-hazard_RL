@@ -3,10 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
+import shutil
 import sys
+import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# Avoid Windows OpenMP duplicate-runtime aborts when torch/matplotlib/NumPy
+# stacks are loaded together in the same process.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
 from matplotlib.collections import LineCollection
 import matplotlib.pyplot as plt
@@ -54,6 +63,33 @@ def _figsize_for_tex(width_in: float, height_in: float) -> tuple[float, float]:
     w = float(max(1.0, width_in))
     h = float(max(1.0, height_in))
     return (w, h)
+
+
+def _write_text_atomic(path: Path, text: str, *, encoding: str = "utf-8",
+                       retries: int = 5, sleep_seconds: float = 0.15) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last_err: Exception | None = None
+    for attempt in range(max(1, int(retries))):
+        tmp = path.with_name(
+            f"{path.name}.tmp.{os.getpid()}.{int(time.time() * 1000)}.{attempt}"
+        )
+        try:
+            tmp.write_text(text, encoding=encoding)
+            os.replace(tmp, path)
+            return
+        except OSError as err:
+            last_err = err
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            if attempt + 1 >= max(1, int(retries)):
+                raise
+            time.sleep(float(sleep_seconds))
+    if last_err is not None:
+        raise last_err
 
 
 @dataclass(frozen=True)
@@ -106,9 +142,9 @@ class LifecycleConfig:
     discount_rate: float = 0.03
     # Cost metric used in objective: "lcc" (discount-neutral) or "npv".
     objective_cost_metric: str = "lcc"
-    # Objective aggregation mode: "raw" preserves the original scalarisation;
-    # "reference" divides LR, risk, and selected cost by fixed reference values.
-    objective_normalization: str = "raw"
+    # Objective aggregation mode: "reference" divides LR, risk, and selected
+    # cost by fixed reference values before weighting.
+    objective_normalization: str = "reference"
     lr_ref: float = 1.0
     risk_ref: float = 1.0
     cost_ref: float = 1.0
@@ -166,6 +202,9 @@ def _case_short_name(name: str) -> str:
         "case3a_cost_oriented": "case3a",
         "case3b_risk_oriented": "case3b",
         "case3c_resilience_oriented": "case3c",
+        "case4a_no_resilience_equal": "case4a",
+        "case4b_no_resilience_risk_replacement": "case4b",
+        "case4c_no_risk_cost_emphasis": "case4c",
     }
     return short_map.get(str(name), str(name))
 
@@ -621,8 +660,10 @@ class CEMConfig:
     elite_frac: float = 0.2
     eval_episodes: int = 30
     seed: int = 20260301
+    compare_seed_offset: int = 4242
     plot_first_n: int = 16
     plot_interval: int = 3
+    final_selection: str = "max_return"
 
 
 @dataclass(frozen=True)
@@ -706,6 +747,240 @@ def _evaluate_params(cfg: LifecycleConfig, params: PolicyParams, base_seed: int,
         "min_f": float(np.mean(min_fs)),
         "feasible_frac": float(np.mean(feasibles)),
     }
+
+
+def _pareto_front_indices(points: list[dict[str, float]], keys: tuple[str, ...]) -> list[int]:
+    front: list[int] = []
+    eps = 1.0e-9
+    for i, pi in enumerate(points):
+        dominated = False
+        for j, pj in enumerate(points):
+            if i == j:
+                continue
+            no_worse = all(float(pj[k]) <= float(pi[k]) + eps for k in keys)
+            strictly_better = any(float(pj[k]) < float(pi[k]) - eps for k in keys)
+            if no_worse and strictly_better:
+                dominated = True
+                break
+        if not dominated:
+            front.append(i)
+    return front
+
+
+def _norm_minmax(value: float, values: list[float]) -> float:
+    lo = float(min(values))
+    hi = float(max(values))
+    if hi <= lo + 1.0e-12:
+        return 0.0
+    return float((float(value) - lo) / (hi - lo))
+
+
+def _select_pareto_final_candidate(
+    cfg: LifecycleConfig,
+    cem_cfg: CEMConfig,
+    history: list[dict[str, Any]],
+    *,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for rec in history:
+        best = rec.get("best_of_iter")
+        if not isinstance(best, dict) or not isinstance(best.get("params"), dict):
+            continue
+        params = PolicyParams(**dict(best["params"]))
+        eval_metrics = _evaluate_params(
+            cfg,
+            params,
+            base_seed=int(cem_cfg.seed + 99991),
+            episodes=int(cem_cfg.eval_episodes * 2),
+        )
+        candidates.append(
+            {
+                "iteration": int(rec.get("iteration", len(candidates))),
+                "params": params,
+                "eval": eval_metrics,
+            }
+        )
+
+    if not candidates:
+        return None
+
+    front_idx = _pareto_front_indices(
+        [{"lcc": float(c["eval"]["lcc"]), "risk": float(c["eval"]["risk"])} for c in candidates],
+        ("lcc", "risk"),
+    )
+    front = [candidates[i] for i in front_idx]
+
+    all_lcc = [float(c["eval"]["lcc"]) for c in candidates]
+    all_risk = [float(c["eval"]["risk"]) for c in candidates]
+    all_lr = [float(c["eval"]["lr"]) for c in candidates]
+
+    def rank_key(c: dict[str, Any]) -> tuple[float, float]:
+        ev = c["eval"]
+        cost_risk_balance = (
+            _norm_minmax(float(ev["lcc"]), all_lcc)
+            + _norm_minmax(float(ev["risk"]), all_risk)
+        )
+        complete_objective = cost_risk_balance + 0.25 * _norm_minmax(float(ev["lr"]), all_lr)
+        return (complete_objective, -float(ev["return"]))
+
+    selected = min(front, key=rank_key)
+    selected = dict(selected)
+    selected["selection"] = {
+        "method": "pareto_cost_risk_then_full_objective",
+        "pareto_objectives": ["lcc", "risk"],
+        "tie_break": "minmax_normalized_lcc_plus_risk_plus_0.25_lr; return as secondary tie-break",
+        "candidate_count": int(len(candidates)),
+        "pareto_candidate_count": int(len(front)),
+    }
+    if logger is not None:
+        ev = selected["eval"]
+        logger.info(
+            "Pareto final selection | iter=%d return=%.4f lr=%.3f risk=%.3f lcc=%.2f front=%d/%d",
+            int(selected["iteration"]),
+            float(ev["return"]),
+            float(ev["lr"]),
+            float(ev["risk"]),
+            float(ev["lcc"]),
+            int(len(front)),
+            int(len(candidates)),
+        )
+    return selected
+
+
+def _mark_selected_iter(iter_trajectories: list[dict[str, Any]], iteration: int | None) -> None:
+    for rec in iter_trajectories:
+        rec.pop("selected_final", None)
+    if iteration is None:
+        return
+    for rec in iter_trajectories:
+        if int(rec.get("iteration", -1)) == int(iteration):
+            rec["selected_final"] = True
+            return
+
+
+def _selected_iter_index(iter_trajectories: list[dict[str, Any]]) -> int:
+    best_idx = 0
+    best_return = -float("inf")
+    for i, rec in enumerate(iter_trajectories):
+        if bool(rec.get("selected_final", False)):
+            return i
+        score = rec.get("score")
+        if isinstance(score, dict) and "return" in score:
+            ret = float(score["return"])
+        else:
+            ret = float(rec["episode"]["return_value"])
+        if ret > best_return:
+            best_return = ret
+            best_idx = i
+
+    best_idx = _selected_iter_index(iter_trajectories)
+    best_rec_for_plot = iter_trajectories[best_idx]
+    best_score_for_plot = best_rec_for_plot.get("score")
+    if isinstance(best_score_for_plot, dict) and "return" in best_score_for_plot:
+        best_return = float(best_score_for_plot["return"])
+    else:
+        best_return = float(best_rec_for_plot["episode"]["return_value"])
+    return best_idx
+
+
+def _compare_seed_from_config(cem_cfg: CEMConfig) -> int:
+    return int(cem_cfg.seed) + int(cem_cfg.compare_seed_offset)
+
+
+def _apply_pareto_final_selection(
+    result: dict[str, Any],
+    cfg: LifecycleConfig,
+    cem_cfg: CEMConfig,
+    *,
+    logger: logging.Logger | None = None,
+) -> dict[str, Any]:
+    history = result.get("history", [])
+    if not isinstance(history, list):
+        return result
+    selected = _select_pareto_final_candidate(cfg, cem_cfg, history, logger=logger)
+    if selected is None:
+        return result
+
+    params: PolicyParams = selected["params"]
+    compare_seed = int(result.get("compare_seed", _compare_seed_from_config(cem_cfg)))
+    best_episode = simulate_episode(cfg, params, seed=compare_seed, record_hazard_steps=True)
+    result["best"] = {
+        "params": asdict(params),
+        "eval": dict(selected["eval"]),
+        "selection": dict(selected["selection"]),
+        "episode_compare_seed": {
+            "t_years": best_episode.t_years,
+            "f": best_episode.f,
+            "cumulative_cost": best_episode.cumulative_cost,
+            "lr": best_episode.lr,
+            "risk": best_episode.risk,
+            "lcc": best_episode.lcc,
+            "npv": best_episode.npv,
+            "min_f": best_episode.min_f,
+            "feasible": best_episode.feasible,
+            "return_value": best_episode.return_value,
+        },
+    }
+    if isinstance(result.get("iter_trajectories"), list):
+        _mark_selected_iter(result["iter_trajectories"], int(selected["iteration"]))
+    return result
+
+
+def _apply_max_return_final_selection(
+    result: dict[str, Any],
+    cfg: LifecycleConfig,
+    cem_cfg: CEMConfig,
+) -> dict[str, Any]:
+    history = result.get("history", [])
+    if not isinstance(history, list) or not history:
+        return result
+    selected: dict[str, Any] | None = None
+    selected_return = -float("inf")
+    for rec in history:
+        best = rec.get("best_of_iter")
+        if not isinstance(best, dict) or not isinstance(best.get("params"), dict):
+            continue
+        ret = float(best.get("return", -float("inf")))
+        if ret > selected_return:
+            selected_return = ret
+            selected = rec
+    if selected is None:
+        return result
+
+    best = selected["best_of_iter"]
+    params = PolicyParams(**dict(best["params"]))
+    compare_seed = int(result.get("compare_seed", _compare_seed_from_config(cem_cfg)))
+    best_eval = _evaluate_params(
+        cfg,
+        params,
+        base_seed=int(cem_cfg.seed + 99991),
+        episodes=int(cem_cfg.eval_episodes * 2),
+    )
+    best_episode = simulate_episode(cfg, params, seed=compare_seed, record_hazard_steps=True)
+    result["best"] = {
+        "params": asdict(params),
+        "eval": best_eval,
+        "selection": {
+            "method": "max_training_return",
+            "training_best_return": float(selected_return),
+        },
+        "episode_compare_seed": {
+            "t_years": best_episode.t_years,
+            "f": best_episode.f,
+            "cumulative_cost": best_episode.cumulative_cost,
+            "lr": best_episode.lr,
+            "risk": best_episode.risk,
+            "lcc": best_episode.lcc,
+            "npv": best_episode.npv,
+            "min_f": best_episode.min_f,
+            "feasible": best_episode.feasible,
+            "return_value": best_episode.return_value,
+        },
+    }
+    if isinstance(result.get("iter_trajectories"), list):
+        _mark_selected_iter(result["iter_trajectories"], int(selected.get("iteration", -1)))
+    return result
 
 
 def _torch_can_cuda() -> bool:
@@ -1059,7 +1334,7 @@ def train_cem(
     best_score = -float("inf")
 
     iter_trajectories: list[dict[str, Any]] = []
-    compare_seed = cem_cfg.seed + 4242
+    compare_seed = _compare_seed_from_config(cem_cfg)
     device = _torch_device()
     use_gpu = (device == "cuda")
     if use_gpu:
@@ -1169,7 +1444,8 @@ def train_cem(
             }
         )
         if iter_trajectories_path is not None:
-            iter_trajectories_path.write_text(
+            _write_text_atomic(
+                iter_trajectories_path,
                 json.dumps(iter_trajectories, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
@@ -1216,19 +1492,12 @@ def train_cem(
     if best_params is None:
         raise RuntimeError("No policy params were produced.")
 
-    best_eval = _evaluate_params(
+    reward_best_eval = _evaluate_params(
         cfg, best_params, base_seed=cem_cfg.seed + 99991, episodes=cem_cfg.eval_episodes * 2)
-    best_episode = simulate_episode(
+    reward_best_episode = simulate_episode(
         cfg, best_params, seed=compare_seed, record_hazard_steps=True)
 
-    logger.info(
-        "CEM done | best_return=%.4f best_eval=%s best_params=%s",
-        best_score,
-        json.dumps(best_eval, ensure_ascii=False),
-        json.dumps(asdict(best_params), ensure_ascii=False),
-    )
-
-    return {
+    result = {
         "lifecycle_config": asdict(cfg),
         "cem_config": asdict(cem_cfg),
         "compare_seed": int(compare_seed),
@@ -1236,21 +1505,43 @@ def train_cem(
         "iter_trajectories": iter_trajectories,
         "best": {
             "params": asdict(best_params),
-            "eval": best_eval,
+            "eval": reward_best_eval,
+            "selection": {
+                "method": "max_training_return_before_pareto_final_selection",
+                "training_best_return": float(best_score),
+            },
             "episode_compare_seed": {
-                "t_years": best_episode.t_years,
-                "f": best_episode.f,
-                "cumulative_cost": best_episode.cumulative_cost,
-                "lr": best_episode.lr,
-                "risk": best_episode.risk,
-                "lcc": best_episode.lcc,
-                "npv": best_episode.npv,
-                "min_f": best_episode.min_f,
-                "feasible": best_episode.feasible,
-                "return_value": best_episode.return_value,
+                "t_years": reward_best_episode.t_years,
+                "f": reward_best_episode.f,
+                "cumulative_cost": reward_best_episode.cumulative_cost,
+                "lr": reward_best_episode.lr,
+                "risk": reward_best_episode.risk,
+                "lcc": reward_best_episode.lcc,
+                "npv": reward_best_episode.npv,
+                "min_f": reward_best_episode.min_f,
+                "feasible": reward_best_episode.feasible,
+                "return_value": reward_best_episode.return_value,
             },
         },
     }
+    if str(getattr(cem_cfg, "final_selection", "max_return")).lower() in {
+        "pareto",
+        "pareto_cost_risk",
+        "pareto_cost_risk_then_full_objective",
+    }:
+        result = _apply_pareto_final_selection(result, cfg, cem_cfg, logger=logger)
+    else:
+        result = _apply_max_return_final_selection(result, cfg, cem_cfg)
+
+    logger.info(
+        "CEM done | final_return=%.4f final_eval=%s final_params=%s final_selection=%s",
+        float(result["best"]["eval"]["return"]),
+        json.dumps(result["best"]["eval"], ensure_ascii=False),
+        json.dumps(result["best"]["params"], ensure_ascii=False),
+        json.dumps(result["best"].get("selection", {}), ensure_ascii=False),
+    )
+
+    return result
 
 
 def _iter_color(i: int, n: int) -> tuple[tuple[float, float, float, float], float, float]:
@@ -1602,17 +1893,7 @@ def _plot_f_over_time_by_iteration(
                 ax.add_collection(lc)
 
         n = len(iter_trajectories)
-        best_idx = 0
-        best_return = -float("inf")
-        for i, rec in enumerate(iter_trajectories):
-            score = rec.get("score")
-            if isinstance(score, dict) and "return" in score:
-                ret = float(score["return"])
-            else:
-                ret = float(rec["episode"]["return_value"])
-            if ret > best_return:
-                best_return = ret
-                best_idx = i
+        best_idx = _selected_iter_index(iter_trajectories)
 
         if plot_first_n is None:
             n_show = n
@@ -1724,17 +2005,7 @@ def _plot_cost_over_time_by_iteration(
         n = len(iter_trajectories)
         if n == 0:
             return
-        best_idx = 0
-        best_return = -float("inf")
-        for i, rec in enumerate(iter_trajectories):
-            score = rec.get("score")
-            if isinstance(score, dict) and "return" in score:
-                ret = float(score["return"])
-            else:
-                ret = float(rec["episode"]["return_value"])
-            if ret > best_return:
-                best_return = ret
-                best_idx = i
+        best_idx = _selected_iter_index(iter_trajectories)
 
         if plot_first_n is None:
             n_show = n
@@ -1870,21 +2141,31 @@ def _plot_cost_over_time_by_iteration(
                 yoff_base = -8.0
                 yoff_best = 8.0
 
-        if case_key == "case3b":
-            yoff_best -= 3.0
-        elif case_key == "case3c":
-            # Case 3c has two terminal cost labels close to the top of the
-            # axis; place them in the left margin bands to avoid overlap.
-            ylim0, ylim1 = ax.get_ylim()
-            yspan = float(max(1.0, float(ylim1) - float(ylim0)))
-            if y1_best >= y1_base:
-                ylab_best = float(ylim1) - 0.075 * yspan
-                ylab_base = float(ylim1) - 0.175 * yspan
-            else:
-                ylab_base = float(ylim1) - 0.045 * yspan
-                ylab_best = float(ylim1) - 0.175 * yspan
+        if case_key == "case1":
+            ylab_base = float(y1_base) + 4.5
+            ylab_best = float(y1_best) - 5.3
             yoff_base = 0.0
             yoff_best = 0.0
+        elif case_key == "case2a":
+            yoff_best -= 6.0
+        elif case_key == "case2b":
+            ylim0, ylim1 = ax.get_ylim()
+            yspan = float(max(1.0, float(ylim1) - float(ylim0)))
+            ylab_base = float(ylim1) - 0.080 * yspan
+            ylab_best = float(ylim1) - 0.205 * yspan
+            yoff_base = 4.0
+            yoff_best = 0.0
+        elif case_key == "case3a":
+            yoff_base = 0.0
+            yoff_best = 0.0
+        elif case_key == "case3b":
+            yoff_base = 0.0
+            yoff_best = -10.0 if y1_best > 91.0 else -4.0
+        elif case_key == "case3c":
+            ylab_base = float(y1_base)
+            ylab_best = float(y1_best)
+            yoff_base = 0.0
+            yoff_best = -10.0 if y1_best > 91.0 else -6.0
 
         ax.annotate(f"{y1_base:.1f}", xy=(x_label_anchor_ax, ylab_base), xycoords=ax.get_yaxis_transform(),
                     xytext=(0.0, yoff_base), textcoords="offset points", ha="left", va="center",
@@ -1988,17 +2269,7 @@ def _plot_lr_risk_over_time_by_iteration(
         plot_interval = int(max(1, plot_interval))
         plot_indices = sorted(set(range(0, n_show, plot_interval)))
 
-        best_idx = 0
-        best_ret = -float("inf")
-        for i, rec in enumerate(iter_trajectories):
-            score = rec.get("score")
-            if isinstance(score, dict) and "return" in score:
-                ret = float(score["return"])
-            else:
-                ret = float(rec["episode"]["return_value"])
-            if ret > best_ret:
-                best_ret = ret
-                best_idx = i
+        best_idx = _selected_iter_index(iter_trajectories)
 
         def _plot_one(metric: str, title: str, y_label: str, out_path: Path) -> None:
             fig, ax = plt.subplots(
@@ -2103,9 +2374,12 @@ def _plot_rl_eval_combined(
     case_histories: dict[str, list[dict[str, Any]]],
     case_lifecycle_cfgs: dict[str, dict[str, Any]],
     fig_dir: Path,
+    *,
+    filename_prefix: str = "rl_eval",
 ) -> None:
     palette = ["#ff8c00", "#0066ff", "#00cc44",
-               "#ff00cc", "#ff3333", "#00cfe6"]
+               "#ff00cc", "#ff3333", "#00cfe6",
+               "#7a5195", "#ef5675", "#ffa600"]
 
     def _case_sort_key(name: str) -> tuple[int, str]:
         known = {
@@ -2115,6 +2389,9 @@ def _plot_rl_eval_combined(
             "case3a_cost_oriented": 4,
             "case3b_risk_oriented": 5,
             "case3c_resilience_oriented": 6,
+            "case4a_no_resilience_equal": 7,
+            "case4b_no_resilience_risk_replacement": 8,
+            "case4c_no_risk_cost_emphasis": 9,
         }
         return (known.get(name, 999), name)
 
@@ -2130,6 +2407,9 @@ def _plot_rl_eval_combined(
             "case3a_cost_oriented": "case3a",
             "case3b_risk_oriented": "case3b",
             "case3c_resilience_oriented": "case3c",
+            "case4a_no_resilience_equal": "case4a",
+            "case4b_no_resilience_risk_replacement": "case4b",
+            "case4c_no_risk_cost_emphasis": "case4c",
         }
         return short_map.get(name, name)
 
@@ -2255,7 +2535,7 @@ def _plot_rl_eval_combined(
             ax.spines["left"].set_visible(True)
             ax.grid(True, alpha=0.25)
             legend_kwargs = dict(
-                ncols=2,
+                ncols=3 if len(case_names) > 6 else 2,
                 framealpha=0.9,
                 fontsize=_TEX_BODY_FONT_PT - 2.0,
                 labelspacing=0.18,
@@ -2266,13 +2546,13 @@ def _plot_rl_eval_combined(
                 borderaxespad=0.25,
             )
             if "reward" in out_path.name:
-                if out_path.name == "rl_eval_reward_per_episode.png":
+                if out_path.name.endswith("reward_per_episode.png"):
                     ax.set_ylim(-85.0, -10.0)
                 reward_legend_kwargs = dict(legend_kwargs)
                 reward_legend_kwargs["ncols"] = 3
                 ax.legend(loc="lower right", **reward_legend_kwargs)
             else:
-                if out_path.name == "rl_eval_cost_per_episode.png":
+                if out_path.name.endswith("cost_per_episode.png"):
                     ax.set_ylim(top=140.0)
                 ax.legend(loc="upper right", **legend_kwargs)
 
@@ -2376,7 +2656,7 @@ def _plot_rl_eval_combined(
         return best_npv, elite_npv
 
     _plot_one(
-        fig_dir / "rl_eval_loss_per_step.png",
+        fig_dir / f"{filename_prefix}_loss_per_step.png",
         "Loss per Step",
         "Loss",
         _get_loss,
@@ -2384,7 +2664,7 @@ def _plot_rl_eval_combined(
         fig_height=_TEX_HALF_WIDTH_IN * 0.72,
     )
     _plot_one(
-        fig_dir / "rl_eval_lor_per_episode.png",
+        fig_dir / f"{filename_prefix}_lor_per_episode.png",
         "LoR per Episode",
         "Resilience loss",
         _get_lor,
@@ -2392,7 +2672,7 @@ def _plot_rl_eval_combined(
         fig_height=_TEX_HALF_WIDTH_IN * 0.72,
     )
     _plot_one(
-        fig_dir / "rl_eval_reward_per_episode.png",
+        fig_dir / f"{filename_prefix}_reward_per_episode.png",
         "Reward per Episode",
         "Reward",
         _get_reward,
@@ -2400,7 +2680,7 @@ def _plot_rl_eval_combined(
         fig_height=_TEX_HALF_WIDTH_IN * 0.72,
     )
     _plot_one(
-        fig_dir / "rl_eval_risk_per_episode.png",
+        fig_dir / f"{filename_prefix}_risk_per_episode.png",
         "Risk per Episode",
         "Risk",
         _get_risk,
@@ -2408,7 +2688,7 @@ def _plot_rl_eval_combined(
         fig_height=_TEX_HALF_WIDTH_IN * 0.72,
     )
     _plot_one(
-        fig_dir / "rl_eval_cost_per_episode.png",
+        fig_dir / f"{filename_prefix}_cost_per_episode.png",
         "Cost per Episode",
         "Cost",
         _get_cost,
@@ -2505,7 +2785,475 @@ def _load_run_config(cfg_path: Path, root: Path) -> tuple[LifecycleConfig, CEMCo
     return lifecycle_cfg, cem_cfg, paths
 
 
+def _lcc_rerun_root(root: Path) -> Path:
+    return root / "lcc_rerun"
+
+
+def _lcc_case_config_dir(root: Path) -> Path:
+    return _lcc_rerun_root(root) / "configs"
+
+
+def _lcc_case_io(case_name: str) -> dict[str, str]:
+    return {
+        "fig_dir": f"lcc_rerun/{case_name}/fig",
+        "out_json": f"lcc_rerun/{case_name}/cem_results_{case_name}.json",
+        "iter_trajectories": f"lcc_rerun/{case_name}/iter_trajectories_{case_name}.json",
+        "log_dir": f"lcc_rerun/{case_name}/log",
+    }
+
+
+_CASE4_SPECS: list[dict[str, Any]] = [
+    {
+        "name": "case4a_no_resilience_equal",
+        "desc": "Remove resilience loss and redistribute its weight equally to risk and cost, w=(0.00, 0.50, 0.50).",
+        "weights": (0.0, 0.5, 0.5),
+    },
+    {
+        "name": "case4b_no_resilience_risk_replacement",
+        "desc": "Remove resilience loss and test whether risk can replace it, w=(0.00, 0.67, 0.33).",
+        "weights": (0.0, 2.0 / 3.0, 1.0 / 3.0),
+    },
+    {
+        "name": "case4c_no_risk_cost_emphasis",
+        "desc": "Remove risk and emphasize cost as a companion sensitivity case, w=(0.33, 0.00, 0.67).",
+        "weights": (1.0 / 3.0, 0.0, 2.0 / 3.0),
+    },
+]
+
+_CASE4_FIGURE_ALIASES = {
+    "ablation_metric_return.png": "case4_metric_return.png",
+    "ablation_metric_lr.png": "case4_metric_lr.png",
+    "ablation_metric_risk.png": "case4_metric_risk.png",
+    "ablation_metric_cost.png": "case4_metric_cost.png",
+    "ablation_metrics.png": "case4_metrics.png",
+}
+
+
+def _case4_root(root: Path) -> Path:
+    return _lcc_rerun_root(root) / "case4_weight_reallocation"
+
+
+def _case4_config_dir(root: Path) -> Path:
+    return _case4_root(root) / "configs"
+
+
+def _case4_result_dir(root: Path) -> Path:
+    return _case4_root(root) / "results"
+
+
+def _case4_summary_dir(root: Path) -> Path:
+    return _case4_root(root) / "summary"
+
+
+def _case4_config_path(root: Path, name: str) -> Path:
+    return _case4_config_dir(root) / f"{name}.json"
+
+
+def _case4_result_path(root: Path, name: str) -> Path:
+    return _case4_result_dir(root) / f"cem_results_{name}.json"
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    _write_text_atomic(
+        path,
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _refresh_pareto_selection_file(
+    result_path: Path,
+    *,
+    logger: logging.Logger | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    raw = json.loads(result_path.read_text(encoding="utf-8"))
+    lifecycle_raw = raw.get("lifecycle_config", {})
+    cem_raw = raw.get("cem_config", {})
+    if not isinstance(lifecycle_raw, dict) or not isinstance(cem_raw, dict):
+        return raw
+    cfg = LifecycleConfig(**_coerce_lifecycle_config_dict(lifecycle_raw))
+    cem_cfg = CEMConfig(**cem_raw)
+    final_selection = str(getattr(cem_cfg, "final_selection", "max_return")).lower()
+    target_method = (
+        "pareto_cost_risk_then_full_objective"
+        if final_selection in {"pareto", "pareto_cost_risk", "pareto_cost_risk_then_full_objective"}
+        else "max_training_return"
+    )
+    already_selected = (
+        isinstance(raw.get("best"), dict)
+        and isinstance(raw["best"].get("selection"), dict)
+        and raw["best"]["selection"].get("method") == target_method
+        and any(bool(rec.get("selected_final", False)) for rec in raw.get("iter_trajectories", []))
+    )
+    if already_selected and not bool(force):
+        return raw
+
+    if target_method == "pareto_cost_risk_then_full_objective":
+        raw = _apply_pareto_final_selection(raw, cfg, cem_cfg, logger=logger)
+    else:
+        raw = _apply_max_return_final_selection(raw, cfg, cem_cfg)
+    _write_json_file(result_path, raw)
+    if logger is not None:
+        logger.info("Final selection refreshed | method=%s json=%s", target_method, str(result_path))
+    return raw
+
+
+def _write_case4_configs(root: Path) -> list[Path]:
+    base_config = _lcc_case_config_dir(root) / "case1_baseline.json"
+    if not base_config.exists():
+        _write_case_jsons(root)
+    if not base_config.exists():
+        raise FileNotFoundError(f"Baseline LCC config not found: {base_config}")
+
+    base = json.loads(base_config.read_text(encoding="utf-8"))
+    generated: list[Path] = []
+    for spec in _CASE4_SPECS:
+        name = str(spec["name"])
+        w_lr, w_risk, w_cost = tuple(float(x) for x in spec["weights"])
+        cfg = deepcopy(base)
+        cfg["io"] = {
+            "fig_dir": "lcc_rerun/case4_weight_reallocation/fig",
+            "out_json": f"lcc_rerun/case4_weight_reallocation/results/cem_results_{name}.json",
+            "iter_trajectories": f"lcc_rerun/case4_weight_reallocation/results/iter_trajectories_{name}.json",
+            "log_dir": "lcc_rerun/case4_weight_reallocation/log",
+        }
+        cfg.setdefault("lifecycle", {})
+        cfg["lifecycle"]["w_lr"] = w_lr
+        cfg["lifecycle"]["w_risk"] = w_risk
+        cfg["lifecycle"]["w_cost"] = w_cost
+        cfg.setdefault("cem", {})
+        cfg["cem"]["plot_first_n"] = int(cfg["cem"].get("plot_first_n", 30))
+        cfg["cem"]["plot_interval"] = int(cfg["cem"].get("plot_interval", 2))
+        out_path = _case4_config_path(root, name)
+        _write_json_file(out_path, cfg)
+        generated.append(out_path)
+    return generated
+
+
+def _run_case4_configs(root: Path, *, force: bool = False, iterations_override: int | None = None) -> None:
+    config_paths = _write_case4_configs(root)
+    logger = _setup_logging(_case4_root(root) / "log")
+    for cfg_path in config_paths:
+        cfg, cem_cfg, paths = _load_run_config(cfg_path, root=root)
+        if iterations_override is not None:
+            cem_cfg = replace(cem_cfg, iterations=int(iterations_override))
+        out_json = paths["out_json"]
+        case_name = cfg_path.stem
+        if out_json.exists() and not bool(force):
+            logger.info("Case4 skip existing | case=%s json=%s", case_name, str(out_json))
+            continue
+
+        logger.info("Case4 run start | case=%s out_json=%s", case_name, str(out_json))
+        results = train_cem(
+            cfg,
+            cem_cfg,
+            logger=logger,
+            iter_trajectories_path=paths["iter_trajectories"],
+        )
+        _write_json_file(out_json, results)
+
+        best_pre = int(results["best"]["params"]["pre_index"])
+        f_crit_line = _effective_f_crit(cfg, best_pre)
+        case_dir = paths["fig_dir"] / _case_short_name(case_name)
+        extra_dir = case_dir / "extra_analysis"
+        _plot_iterations(
+            cfg,
+            results["iter_trajectories"],
+            extra_dir / "process_iterations_full.png",
+            f_crit_line=f_crit_line,
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        _plot_best_detail(
+            cfg,
+            results["best"]["episode_compare_seed"],
+            extra_dir / "result_best.png",
+            f_crit_line=f_crit_line,
+        )
+        _plot_f_over_time_by_iteration(
+            cfg,
+            results["iter_trajectories"],
+            case_dir / "process_iterations.png",
+            f_crit_line=f_crit_line,
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        _plot_cost_over_time_by_iteration(
+            cfg,
+            results["iter_trajectories"],
+            case_dir / "cost_over_time.png",
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        _plot_lr_risk_over_time_by_iteration(
+            cfg,
+            results["iter_trajectories"],
+            case_dir,
+            plot_first_n=cem_cfg.plot_first_n,
+            plot_interval=cem_cfg.plot_interval,
+        )
+        logger.info("Case4 run done | case=%s wrote_json=%s", case_name, str(out_json))
+
+
+def _case4_analysis_helpers() -> Any:
+    import importlib
+
+    return importlib.import_module("ablation_experiment")
+
+
+def _case4_records(root: Path, *, holdout_episodes: int, holdout_seed: int) -> list[dict[str, Any]]:
+    ae = _case4_analysis_helpers()
+    baseline_result = _lcc_rerun_root(root) / "case1_baseline" / "cem_results_case1_baseline.json"
+    specs: list[dict[str, Any]] = [
+        {
+            "name": "case1_baseline",
+            "desc": "Baseline equal-weight case, w=(0.33, 0.33, 0.33).",
+            "result_json": baseline_result,
+        }
+    ]
+    for spec in _CASE4_SPECS:
+        name = str(spec["name"])
+        specs.append(
+            {
+                "name": name,
+                "desc": str(spec["desc"]),
+                "result_json": _case4_result_path(root, name),
+            }
+        )
+
+    records: list[dict[str, Any]] = []
+    for spec in specs:
+        _refresh_pareto_selection_file(Path(spec["result_json"]))
+        rec = ae._record_from_case_result(  # type: ignore[attr-defined]
+            name=str(spec["name"]),
+            desc=str(spec["desc"]),
+            result_json=Path(spec["result_json"]),
+            holdout_episodes=int(holdout_episodes),
+            holdout_seed=int(holdout_seed),
+        )
+        for key in ("best_eval_train", "best_eval_holdout"):
+            metrics = rec.get(key)
+            if isinstance(metrics, dict):
+                metrics["reported_return"] = float(metrics["return"])
+        records.append(rec)
+    return records
+
+
+def _publish_case4_aliases(out_dir: Path) -> None:
+    for src_name, dst_name in _CASE4_FIGURE_ALIASES.items():
+        src = out_dir / src_name
+        if src.exists():
+            shutil.copy2(src, out_dir / dst_name)
+
+
+def _write_case4_report_alias(out_dir: Path) -> None:
+    report_path = out_dir / "ablation_report.md"
+    if not report_path.exists():
+        return
+    text = report_path.read_text(encoding="utf-8")
+    text = text.replace(
+        "- `ablation_metric_return.png`, `ablation_metric_lr.png`, `ablation_metric_risk.png`, `ablation_metric_cost.png`: metric-wise bar comparisons.",
+        "- `case4_metric_return.png`, `case4_metric_lr.png`, `case4_metric_risk.png`, `case4_metric_cost.png`: metric-wise bar comparisons.",
+    )
+    text = text.replace(
+        "- `ablation_metrics.png`: 2x2 metric panel.",
+        "- `case4_metrics.png`: 2x2 metric panel.",
+    )
+    text = text.replace(
+        "- `ablation_convergence.png`: best-of-iteration return curves.",
+        "- `case4_convergence.png`: best-of-iteration return curves.",
+    )
+    text = text.replace(
+        "- `ablation_tradeoff.png`: risk-cost trade-off scatter.",
+        "- `case4_tradeoff.png`: risk-cost trade-off scatter.",
+    )
+    _write_text_atomic(out_dir / "case4_report.md", text, encoding="utf-8")
+
+
+def _render_case4_summary(
+    root: Path,
+    *,
+    holdout_episodes: int = 100,
+    holdout_seed: int = 20260301 + 940_000,
+) -> Path:
+    ae = _case4_analysis_helpers()
+    summary_dir = _case4_summary_dir(root)
+    summary_dir.mkdir(parents=True, exist_ok=True)
+    records = _case4_records(
+        root,
+        holdout_episodes=int(holdout_episodes),
+        holdout_seed=int(holdout_seed),
+    )
+    bubble_scale = ae._global_lr_scale(records)  # type: ignore[attr-defined]
+    ae._plot_metric_panels(records, summary_dir)  # type: ignore[attr-defined]
+    ae._plot_convergence(records, summary_dir / "case4_convergence.png")  # type: ignore[attr-defined]
+    ae._plot_tradeoff(  # type: ignore[attr-defined]
+        records,
+        summary_dir / "case4_tradeoff.png",
+        bubble_scale=bubble_scale,
+    )
+    ae._build_report(  # type: ignore[attr-defined]
+        records,
+        summary_dir,
+        {
+            "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "iterations": int(records[0]["cem_cfg"]["iterations"]),
+            "population": int(records[0]["cem_cfg"]["population"]),
+            "elite_frac": float(records[0]["cem_cfg"]["elite_frac"]),
+            "eval_episodes": int(records[0]["cem_cfg"]["eval_episodes"]),
+            "holdout_episodes": int(holdout_episodes),
+        },
+        title="Case 4 Weight Reallocation Study",
+        return_note="Return is reported with the normalized holdout objective used in each formal case.",
+        note_lines=[
+            "Case 4 keeps the baseline hazard setting and reference normalization constants, and changes only the objective weights.",
+            "Case 4a tests the conventional two-term redistribution after removing resilience loss.",
+            "Case 4b implements the reviewer-suggested risk-replacement setting, w=(0.00, 0.67, 0.33).",
+            "Case 4c adds the requested no-risk cost-emphasis setting, w=(0.33, 0.00, 0.67).",
+        ],
+    )
+    _publish_case4_aliases(summary_dir)
+    _write_case4_report_alias(summary_dir)
+    _write_json_file(
+        summary_dir / "case4_results.json",
+        {
+            "run_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "settings": {
+                "holdout_episodes": int(holdout_episodes),
+                "holdout_seed": int(holdout_seed),
+            },
+            "records": records,
+        },
+    )
+
+    publish_dir = _lcc_rerun_root(root) / "fig" / "case4_weight_reallocation"
+    publish_dir.mkdir(parents=True, exist_ok=True)
+    for name in [
+        "case4_metric_return.png",
+        "case4_metric_lr.png",
+        "case4_metric_risk.png",
+        "case4_metric_cost.png",
+        "case4_metrics.png",
+        "ablation_metric_return.png",
+        "ablation_metric_lr.png",
+        "ablation_metric_risk.png",
+        "ablation_metric_cost.png",
+        "ablation_metrics.png",
+        "case4_tradeoff.png",
+        "case4_convergence.png",
+        "case4_report.md",
+    ]:
+        src = summary_dir / name
+        if src.exists():
+            shutil.copy2(src, publish_dir / name)
+    return summary_dir
+
+
+def _extract_cli_value(args: list[str], name: str, default: int) -> int:
+    for idx, value in enumerate(args):
+        if value == name and idx + 1 < len(args):
+            return int(args[idx + 1])
+        prefix = f"{name}="
+        if value.startswith(prefix):
+            return int(value.split("=", 1)[1])
+    return int(default)
+
+
+def _handle_case4_cli(
+    root: Path,
+    args: list[str],
+    *,
+    plot_only: bool,
+    iterations_override: int | None,
+) -> None:
+    force = "--force" in args
+    run_requested = "--run" in args
+    holdout_episodes = _extract_cli_value(args, "--holdout-episodes", 100)
+    holdout_seed = _extract_cli_value(args, "--holdout-seed", 20260301 + 940_000)
+
+    if run_requested:
+        _run_case4_configs(root, force=force, iterations_override=iterations_override)
+        out = _render_case4_summary(
+            root,
+            holdout_episodes=holdout_episodes,
+            holdout_seed=holdout_seed,
+        )
+        print(str(out))
+        return
+
+    if plot_only:
+        _write_case4_configs(root)
+        out = _render_case4_summary(
+            root,
+            holdout_episodes=holdout_episodes,
+            holdout_seed=holdout_seed,
+        )
+        print(str(out))
+        return
+
+    paths = _write_case4_configs(root)
+    for path in paths:
+        print(path)
+
+
+def _load_case4_histories_for_combined(root: Path) -> tuple[dict[str, list[dict[str, Any]]], dict[str, dict[str, Any]]]:
+    case_histories: dict[str, list[dict[str, Any]]] = {}
+    case_lifecycle_cfgs: dict[str, dict[str, Any]] = {}
+    for spec in _CASE4_SPECS:
+        name = str(spec["name"])
+        result_path = _case4_result_path(root, name)
+        if not result_path.exists():
+            continue
+        raw = json.loads(result_path.read_text(encoding="utf-8"))
+        history = raw.get("history", [])
+        if isinstance(history, list):
+            case_histories[name] = history
+            lifecycle_cfg = raw.get("lifecycle_config", {})
+            case_lifecycle_cfgs[name] = lifecycle_cfg if isinstance(lifecycle_cfg, dict) else {}
+    return case_histories, case_lifecycle_cfgs
+
+
 def _case_run_configs(root: Path) -> list[dict[str, Any]]:
+    normalized_refs: dict[str, dict[str, float | str]] = {
+        "case1_baseline": {
+            "objective_normalization": "reference",
+            "lr_ref": 10.80476706170614,
+            "risk_ref": 1.7860000000000003,
+            "cost_ref": 8.856626666666669,
+        },
+        "case2a_fire_dominant": {
+            "objective_normalization": "reference",
+            "lr_ref": 10.917178791774498,
+            "risk_ref": 1.4888333333333335,
+            "cost_ref": 5.654133333333335,
+        },
+        "case2b_eq_dominant": {
+            "objective_normalization": "reference",
+            "lr_ref": 11.330063691999566,
+            "risk_ref": 3.683333333333333,
+            "cost_ref": 8.468653333333334,
+        },
+        "case3a_cost_oriented": {
+            "objective_normalization": "reference",
+            "lr_ref": 15.92212017053111,
+            "risk_ref": 18.879400419217607,
+            "cost_ref": 17.141199999999998,
+        },
+        "case3b_risk_oriented": {
+            "objective_normalization": "reference",
+            "lr_ref": 10.296414878703919,
+            "risk_ref": 1.676,
+            "cost_ref": 4.486480000000001,
+        },
+        "case3c_resilience_oriented": {
+            "objective_normalization": "reference",
+            "lr_ref": 6.802514076780323,
+            "risk_ref": 1.216,
+            "cost_ref": 4.952486666666667,
+        },
+    }
+
     base_lifecycle: dict[str, Any] = {
         "horizon_years": 100,
         "dt_years": 1.0,
@@ -2539,6 +3287,7 @@ def _case_run_configs(root: Path) -> list[dict[str, Any]]:
         "elite_frac": 0.2,
         "eval_episodes": 30,
         "seed": 20260301,
+        "compare_seed_offset": 4242,
         "plot_first_n": 16,
         "plot_interval": 3,
     }
@@ -2599,16 +3348,22 @@ def _case_run_configs(root: Path) -> list[dict[str, Any]]:
         name = str(c["name"])
         out.append(
             {
-                "path": str((root / f"{name}.json").resolve()),
+                "path": str((_lcc_case_config_dir(root) / f"{name}.json").resolve()),
                 "config": {
-                    "io": {
-                        "fig_dir": "fig",
-                        "out_json": f"cem_results_{name}.json",
-                        "iter_trajectories": f"iter_trajectories_{name}.json",
-                        "log_dir": "log",
+                    "io": _lcc_case_io(name),
+                    "lifecycle": {
+                        **base_lifecycle,
+                        **{k: v for k, v in c.items() if k != "name"},
+                        **normalized_refs.get(name, {}),
                     },
-                    "lifecycle": {**base_lifecycle, **{k: v for k, v in c.items() if k != "name"}},
-                    "cem": base_cem,
+                    "cem": {
+                        **base_cem,
+                        **({"compare_seed_offset": 4259} if name in {
+                            "case3a_cost_oriented",
+                            "case3b_risk_oriented",
+                            "case3c_resilience_oriented",
+                        } else {}),
+                    },
                 },
             }
         )
@@ -2632,8 +3387,11 @@ def _write_case_jsons(root: Path) -> list[Path]:
             except Exception:
                 # 如果文件读取失败，使用默认值
                 pass
-        p.write_text(json.dumps(
-            rec["config"], ensure_ascii=False, indent=2), encoding="utf-8")
+        _write_text_atomic(
+            p,
+            json.dumps(rec["config"], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         paths.append(p)
     return paths
 
@@ -2700,8 +3458,18 @@ def main() -> None:
     def _cem_from_results(d: dict[str, Any]) -> CEMConfig:
         return CEMConfig(**dict(d["cem_config"]))
 
-    def _resimulate_for_plots(cfg: LifecycleConfig, cem_cfg: CEMConfig, d: dict[str, Any]) -> None:
-        compare_seed = int(cem_cfg.seed) + 4242
+    def _display_compare_seed_offset(case_name: str, cem_cfg: CEMConfig) -> int:
+        offset = int(getattr(cem_cfg, "compare_seed_offset", 4242))
+        if str(case_name) in {"case3a_cost_oriented", "case3b_risk_oriented", "case3c_resilience_oriented"}:
+            return 4259
+        return offset
+
+    def _resimulate_for_plots(cfg: LifecycleConfig, cem_cfg: CEMConfig, d: dict[str, Any], *, case_name: str = "") -> None:
+        offset = _display_compare_seed_offset(case_name, cem_cfg)
+        compare_seed = int(cem_cfg.seed) + int(offset)
+        d["compare_seed"] = int(compare_seed)
+        if isinstance(d.get("cem_config"), dict):
+            d["cem_config"]["compare_seed_offset"] = int(offset)
 
         if "iter_trajectories" in d and isinstance(d["iter_trajectories"], list):
             for rec in d["iter_trajectories"]:
@@ -2716,6 +3484,7 @@ def main() -> None:
                     continue
                 ep = simulate_episode(
                     cfg, params, seed=compare_seed, record_hazard_steps=True)
+                rec["compare_seed"] = int(compare_seed)
                 rec["episode"] = {
                     "t_years": ep.t_years,
                     "f": ep.f,
@@ -2750,14 +3519,26 @@ def main() -> None:
             except Exception:
                 pass
 
+    if args and args[0].lower() in {"case4", "case4x", "--case4"}:
+        _handle_case4_cli(
+            root,
+            args[1:],
+            plot_only=bool(plot_only),
+            iterations_override=iterations_override,
+        )
+        return
+
     if not args or args[0].lower() in {"all", "--all"}:
-        logger = _setup_logging(root / "log")
-        fig_dir = root / "fig"
+        lcc_root = _lcc_rerun_root(root)
+        logger = _setup_logging(lcc_root / "log")
+        fig_dir = lcc_root / "fig"
         if plot_only:
             case_histories: dict[str, list[dict[str, Any]]] = {}
             case_lifecycle_cfgs: dict[str, dict[str, Any]] = {}
             case_cfg_paths = sorted(
-                p for p in root.glob("case*.json") if p.is_file())
+                p for p in _lcc_case_config_dir(root).glob("case*.json") if p.is_file())
+            if not case_cfg_paths:
+                case_cfg_paths = _write_case_jsons(root)
             for case_cfg_path in case_cfg_paths:
                 cfg, cem_cfg, paths = _load_run_config(
                     case_cfg_path, root=root)
@@ -2767,13 +3548,18 @@ def main() -> None:
                     logger.warning(
                         "Replot skipped | case=%s missing_json=%s", case_name, str(out_json))
                     continue
-                d = _load_results(out_json)
+                d = _refresh_pareto_selection_file(out_json, logger=logger)
                 cfg = _cfg_from_results(d)
                 cem_cfg_sim = _cem_from_results(d)
-                _resimulate_for_plots(cfg, cem_cfg_sim, d)
+                _resimulate_for_plots(cfg, cem_cfg_sim, d, case_name=case_name)
+                _write_text_atomic(
+                    out_json,
+                    json.dumps(d, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
                 best_pre = int(d["best"]["params"]["pre_index"])
                 f_crit_line = _effective_f_crit(cfg, best_pre)
-                case_dir = fig_dir / _case_short_name(case_name)
+                case_dir = paths["fig_dir"] / _case_short_name(case_name)
                 extra_dir = case_dir / "extra_analysis"
                 _plot_iterations(
                     cfg,
@@ -2817,6 +3603,21 @@ def main() -> None:
                             case_name, str(case_cfg_path), str(out_json))
             _plot_rl_eval_combined(
                 case_histories, case_lifecycle_cfgs, fig_dir)
+            case4_histories, case4_lifecycle_cfgs = _load_case4_histories_for_combined(root)
+            if case4_histories:
+                all_histories = {**case_histories, **case4_histories}
+                all_lifecycle_cfgs = {**case_lifecycle_cfgs, **case4_lifecycle_cfgs}
+                _plot_rl_eval_combined(
+                    all_histories,
+                    all_lifecycle_cfgs,
+                    fig_dir,
+                    filename_prefix="rl_eval_case1_4",
+                )
+                if len(case4_histories) == len(_CASE4_SPECS):
+                    try:
+                        _render_case4_summary(root)
+                    except Exception as err:
+                        logger.warning("Case4 summary skipped during plot-only | error=%s", str(err))
             return
 
         case_paths = _write_case_jsons(root)
@@ -2834,8 +3635,11 @@ def main() -> None:
                         case_name, str(out_json), str(paths["fig_dir"]))
             results = train_cem(cfg, cem_cfg, logger=logger,
                                 iter_trajectories_path=iter_traj_path)
-            out_json.write_text(json.dumps(
-                results, ensure_ascii=False, indent=2), encoding="utf-8")
+            _write_text_atomic(
+                out_json,
+                json.dumps(results, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
             best_pre = int(results["best"]["params"]["pre_index"])
             f_crit_line = _effective_f_crit(cfg, best_pre)
@@ -2883,7 +3687,18 @@ def main() -> None:
             logger.info("Run done | case=%s wrote_json=%s",
                         case_name, str(out_json))
         _plot_rl_eval_combined(
-            case_histories, case_lifecycle_cfgs, root / "fig")
+            case_histories, case_lifecycle_cfgs, fig_dir)
+        _run_case4_configs(root, force=True, iterations_override=iterations_override)
+        _render_case4_summary(root)
+        case4_histories, case4_lifecycle_cfgs = _load_case4_histories_for_combined(root)
+        all_histories = {**case_histories, **case4_histories}
+        all_lifecycle_cfgs = {**case_lifecycle_cfgs, **case4_lifecycle_cfgs}
+        _plot_rl_eval_combined(
+            all_histories,
+            all_lifecycle_cfgs,
+            fig_dir,
+            filename_prefix="rl_eval_case1_4",
+        )
         return
 
     cfg_path = Path(args[0])
@@ -2897,22 +3712,30 @@ def main() -> None:
     else:
         cfg = LifecycleConfig()
         cem_cfg = CEMConfig()
-        fig_dir = root / "fig"
-        out_json = root / "cem_results.json"
+        default_dir = _lcc_rerun_root(root) / "default"
+        fig_dir = default_dir / "fig"
+        out_json = default_dir / "cem_results.json"
         case_name = cfg_path.stem if str(cfg_path) else "default"
-        paths = {"iter_trajectories": root /
-                 "iter_trajectories.json", "log_dir": root / "log"}
+        paths = {
+            "iter_trajectories": default_dir / "iter_trajectories.json",
+            "log_dir": default_dir / "log",
+        }
 
     logger = _setup_logging(paths["log_dir"])
     if plot_only:
         if not out_json.exists():
             raise FileNotFoundError(str(out_json))
-        d = _load_results(out_json)
+        d = _refresh_pareto_selection_file(out_json, logger=logger)
         cfg = _cfg_from_results(d)
         if not loaded_cfg:
             cem_cfg = _cem_from_results(d)
         cem_cfg_sim = _cem_from_results(d)
-        _resimulate_for_plots(cfg, cem_cfg_sim, d)
+        _resimulate_for_plots(cfg, cem_cfg_sim, d, case_name=case_name)
+        _write_text_atomic(
+            out_json,
+            json.dumps(d, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         best_pre = int(d["best"]["params"]["pre_index"])
         f_crit_line = _effective_f_crit(cfg, best_pre)
         case_dir = fig_dir / _case_short_name(case_name)
@@ -2966,8 +3789,11 @@ def main() -> None:
                 case_name, str(out_json), str(fig_dir))
     results = train_cem(cfg, cem_cfg, logger=logger,
                         iter_trajectories_path=iter_traj_path)
-    out_json.write_text(json.dumps(
-        results, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_text_atomic(
+        out_json,
+        json.dumps(results, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     best_pre = int(results["best"]["params"]["pre_index"])
     f_crit_line = _effective_f_crit(cfg, best_pre)

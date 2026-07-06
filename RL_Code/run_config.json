@@ -1,9 +1,9 @@
 {
     "io": {
-        "fig_dir": "fig",
-        "out_json": "cem_results.json",
-        "iter_trajectories": "iter_trajectories.json",
-        "log_dir": "log"
+        "fig_dir": "lcc_rerun/run_config/fig",
+        "out_json": "lcc_rerun/run_config/cem_results.json",
+        "iter_trajectories": "lcc_rerun/run_config/iter_trajectories.json",
+        "log_dir": "lcc_rerun/run_config/log"
     },
     "lifecycle": {
         "horizon_years": 100,
@@ -71,7 +71,12 @@
         "w_cost": 1.2,
         "discount_rate": 0.03,
         "w_floor": 0.0,
-        "repair_stop_years": 0.0
+        "repair_stop_years": 0.0,
+        "objective_normalization": "reference",
+        "objective_cost_metric": "lcc",
+        "lr_ref": 10.80476706170614,
+        "risk_ref": 1.7860000000000003,
+        "cost_ref": 8.856626666666669
     },
     "cem": {
         "iterations": 200,
@@ -83,4 +88,3 @@
         "plot_interval": 3
     }
 }
-

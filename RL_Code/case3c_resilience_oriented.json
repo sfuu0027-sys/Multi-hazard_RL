@@ -1,9 +1,9 @@
 {
   "io": {
-    "fig_dir": "fig",
-    "out_json": "cem_results_case3c_resilience_oriented.json",
-    "iter_trajectories": "iter_trajectories_case3c_resilience_oriented.json",
-    "log_dir": "log"
+    "fig_dir": "lcc_rerun/case3c_resilience_oriented/fig",
+    "out_json": "lcc_rerun/case3c_resilience_oriented/cem_results_case3c_resilience_oriented.json",
+    "iter_trajectories": "lcc_rerun/case3c_resilience_oriented/iter_trajectories_case3c_resilience_oriented.json",
+    "log_dir": "lcc_rerun/case3c_resilience_oriented/log"
   },
   "lifecycle": {
     "horizon_years": 100,
@@ -58,7 +58,11 @@
     "lambda_fire_per_year": 0.29239766081871343,
     "w_lr": 0.7,
     "w_risk": 0.15,
-    "w_cost": 0.15
+    "w_cost": 0.15,
+    "objective_normalization": "reference",
+    "lr_ref": 6.802514076780323,
+    "risk_ref": 1.216,
+    "cost_ref": 4.952486666666667
   },
   "cem": {
     "iterations": 200,
